@@ -4,7 +4,7 @@ pragma solidity ^0.8.20;
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
-contract HashDropCampaign is Ownable(msg.sender), ReentrancyGuard {
+contract HashDropCampaign is Ownable, ReentrancyGuard {
     uint256 private _campaignIdCounter;
     
     enum CampaignStatus { CREATED, ACTIVE, PAUSED, ENDED }
@@ -49,6 +49,8 @@ contract HashDropCampaign is Ownable(msg.sender), ReentrancyGuard {
         require(campaigns[campaignId].creator == msg.sender, "Only campaign creator");
         _;
     }
+
+    constructor() Ownable(msg.sender) {}
     
     function createCampaign(
         string memory hashtag,
