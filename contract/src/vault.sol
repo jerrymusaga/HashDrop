@@ -7,7 +7,6 @@ import {HashDropNFT} from "./NFT.sol";
 import {HashDropCampaign} from "./Campaign.sol";
 
 contract HashDropVault is Ownable, ReentrancyGuard {
-    uint256 private _vaultIdCounter;
     
     struct VaultConfig {
         address campaignContract;
@@ -59,8 +58,38 @@ contract HashDropVault is Ownable, ReentrancyGuard {
         authorizedClaimers[claimer] = authorized;
         emit ClaimerAuthorized(claimer, authorized);
     }
+
+    function processSimpleRewardClaim(
+        uint256 campaignId,
+        address user,
+        uint256 score
+    ) external onlyAuthorizedClaimer nonReentrant validVault(campaignId) {
+        VaultConfig storage config = vaultConfigs[campaignId];
+        require(config.active, "Vault not active");
+        require(!config.hasClaimed[user], "User already claimed");
+        require(config.claimedRewards < config.totalRewards, "No rewards remaining");
+        
+        HashDropCampaign campaignContract = HashDropCampaign(config.campaignContract);
+        HashDropCampaign.RewardMode rewardMode = campaignContract.getRewardMode(campaignId);
+        require(rewardMode == HashDropCampaign.RewardMode.SIMPLE, "Campaign not in simple mode");
+        
+        uint256 minScore = campaignContract.getMinScore(campaignId);
+        require(score >= minScore, "Score below minimum threshold");
+        
+        // Mark as claimed
+        config.hasClaimed[user] = true;
+        config.claimedRewards++;
+        
+        // Mint simple NFT
+        HashDropNFT nftContract = HashDropNFT(config.rewardContract);
+        require(nftContract.simpleNFTAvailable(), "Simple NFT not available");
+        
+        uint256 tokenId = nftContract.mintSimple(user);
+        
+        emit RewardClaimed(campaignId, user, 0, tokenId); // tier = 0 for simple NFTs
+    }
     
-    function processRewardClaim(
+    function processTieredRewardClaim(
         uint256 campaignId,
         address user,
         uint256 score
@@ -69,6 +98,10 @@ contract HashDropVault is Ownable, ReentrancyGuard {
         require(config.active, "Vault not active");
         require(!config.hasClaimed[user], "Already claimed");
         require(config.claimedRewards < config.totalRewards, "No rewards left");
+        
+        HashDropCampaign campaignContract = HashDropCampaign(config.campaignContract);
+        HashDropCampaign.RewardMode rewardMode = campaignContract.getRewardMode(campaignId);
+        require(rewardMode == HashDropCampaign.RewardMode.TIERED, "Campaign not in tiered mode");
 
         HashDropNFT.Tier tier = _determineTier(campaignId, score);
         HashDropNFT nftContract = HashDropNFT(config.rewardContract);
