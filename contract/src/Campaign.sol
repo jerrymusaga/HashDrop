@@ -9,7 +9,6 @@ contract HashDropCampaign is Ownable, ReentrancyGuard {
     
     enum CampaignStatus { CREATED, ACTIVE, PAUSED, ENDED }
     enum RewardType { NFT, TOKEN }
-    enum RewardMode { SIMPLE, TIERED }
     
     struct Campaign {
         uint256 id;
@@ -20,13 +19,11 @@ contract HashDropCampaign is Ownable, ReentrancyGuard {
         uint256 endTime;
         CampaignStatus status;
         RewardType rewardType;
-        RewardMode rewardMode;
         address rewardContract;
         uint256 totalBudget;
         uint256 remainingBudget;
-        uint256 minScore;
-        mapping(uint256 => uint256) scoreThresholds;
         mapping(address => bool) hasParticipated;
+        mapping(address => uint256) participantScores;
         uint256 participantCount;
         bool crossChainEnabled;
         uint256[] supportedChainIds;
@@ -42,7 +39,8 @@ contract HashDropCampaign is Ownable, ReentrancyGuard {
         string hashtag,
         address indexed creator,
         uint256 startTime,
-        uint256 endTime
+        uint256 endTime,
+        address rewardContract
     );
     event CampaignStatusChanged(uint256 indexed campaignId, CampaignStatus newStatus);
     event VaultRegistered(uint256 indexed campaignId, uint256 chainId, address vault);
@@ -60,48 +58,23 @@ contract HashDropCampaign is Ownable, ReentrancyGuard {
 
     constructor() Ownable(msg.sender) {}
 
-    function createSimpleCampaign(
+    /**
+     * @dev Create a new campaign with flexible NFT tier configuration
+     * @param hashtag Unique hashtag for the campaign
+     * @param description Campaign description
+     * @param duration Campaign duration in seconds
+     * @param rewardType Type of reward (NFT or TOKEN)
+     * @param rewardContract Address of the reward contract (HashDropNFT for NFT campaigns)
+     * @param totalBudget Total budget allocated for rewards
+     * @param supportedChainIds Array of supported chain IDs for cross-chain functionality
+     */
+    function createCampaign(
         string memory hashtag,
         string memory description,
         uint256 duration,
         RewardType rewardType,
         address rewardContract,
         uint256 totalBudget,
-        uint256 minScore, 
-        uint256[] memory supportedChainIds
-    ) external returns (uint256) {
-        require(bytes(hashtag).length > 0, "Hashtag cannot be empty");
-        require(hashtagToCampaignId[hashtag] == 0, "Hashtag already in use");
-        require(duration > 0, "Duration must be positive");
-        require(rewardContract != address(0), "Invalid reward contract");
-        require(minScore > 0 && minScore <= 100, "Invalid minimum score");
-        require(supportedChainIds.length > 0, "Must support at least one chain");
-        
-        uint256 campaignId = _createBaseCampaign(
-            hashtag, 
-            description, 
-            duration, 
-            rewardType, 
-            rewardContract, 
-            totalBudget, 
-            supportedChainIds
-        );
-        
-        Campaign storage campaign = campaigns[campaignId];
-        campaign.rewardMode = RewardMode.SIMPLE;
-        campaign.minScore = minScore;
-        
-        return campaignId;
-    }
-    
-    function createTieredCampaign(
-        string memory hashtag,
-        string memory description,
-        uint256 duration,
-        RewardType rewardType,
-        address rewardContract,
-        uint256 totalBudget,
-        uint256[] memory scoreThresholds,
         uint256[] memory supportedChainIds
     ) external returns (uint256) {
         require(bytes(hashtag).length > 0, "Hashtag cannot be empty");
@@ -109,41 +82,8 @@ contract HashDropCampaign is Ownable, ReentrancyGuard {
         require(duration > 0, "Duration must be positive");
         require(rewardContract != address(0), "Invalid reward contract");
         require(supportedChainIds.length > 0, "Must support at least one chain");
-        require(scoreThresholds.length >= 3, "Need bronze, silver, gold thresholds");
-        require(scoreThresholds[0] < scoreThresholds[1] && scoreThresholds[1] < scoreThresholds[2], "Thresholds must be ascending");
         
-        uint256 campaignId = _createBaseCampaign(
-            hashtag, 
-            description, 
-            duration, 
-            rewardType, 
-            rewardContract, 
-            totalBudget, 
-            supportedChainIds
-        );
-        
-        Campaign storage campaign = campaigns[campaignId];
-        campaign.rewardMode = RewardMode.TIERED;
-        
-        // Set tier thresholds (bronze=0, silver=1, gold=2)
-        campaign.scoreThresholds[0] = scoreThresholds[0];
-        campaign.scoreThresholds[1] = scoreThresholds[1];
-        campaign.scoreThresholds[2] = scoreThresholds[2];
-        
-        return campaignId;
-    }
-
-    function _createBaseCampaign(
-        string memory hashtag,
-        string memory description,
-        uint256 duration,
-        RewardType rewardType,
-        address rewardContract,
-        uint256 totalBudget,
-        uint256[] memory supportedChainIds
-    ) internal returns (uint256) {
-        uint256 campaignId = _campaignIdCounter;
-        _campaignIdCounter++;
+        uint256 campaignId = _campaignIdCounter++;
         
         Campaign storage campaign = campaigns[campaignId];
         campaign.id = campaignId;
@@ -164,10 +104,21 @@ contract HashDropCampaign is Ownable, ReentrancyGuard {
         hashtagToCampaignId[hashtag] = campaignId;
         creatorCampaigns[msg.sender].push(campaignId);
         
-        emit CampaignCreated(campaignId, hashtag, msg.sender, campaign.startTime, campaign.endTime);
+        emit CampaignCreated(
+            campaignId, 
+            hashtag, 
+            msg.sender, 
+            campaign.startTime, 
+            campaign.endTime,
+            rewardContract
+        );
+        
         return campaignId;
     }
     
+    /**
+     * @dev Register a vault for a specific chain
+     */
     function registerVault(
         uint256 campaignId,
         uint256 chainId,
@@ -189,6 +140,9 @@ contract HashDropCampaign is Ownable, ReentrancyGuard {
         emit VaultRegistered(campaignId, chainId, vault);
     }
     
+    /**
+     * @dev Set campaign status
+     */
     function setCampaignStatus(
         uint256 campaignId,
         CampaignStatus newStatus
@@ -203,6 +157,9 @@ contract HashDropCampaign is Ownable, ReentrancyGuard {
         emit CampaignStatusChanged(campaignId, newStatus);
     }
     
+    /**
+     * @dev Record user participation with their score
+     */
     function recordParticipation(
         uint256 campaignId,
         address participant,
@@ -219,12 +176,16 @@ contract HashDropCampaign is Ownable, ReentrancyGuard {
         require(score > 0 && score <= 100, "Invalid score range");
         
         campaign.hasParticipated[participant] = true;
+        campaign.participantScores[participant] = score;
         campaign.participantCount++;
         
         emit ParticipationRecorded(campaignId, participant, score);
     }
     
-    function getCampaignCoreInfo(uint256 campaignId) external view validCampaign(campaignId) returns (
+    /**
+     * @dev Get core campaign information
+     */
+    function getCampaignInfo(uint256 campaignId) external view validCampaign(campaignId) returns (
         uint256 id,
         string memory hashtag,
         string memory description,
@@ -232,7 +193,8 @@ contract HashDropCampaign is Ownable, ReentrancyGuard {
         uint256 startTime,
         uint256 endTime,
         CampaignStatus status,
-        RewardType rewardType
+        RewardType rewardType,
+        address rewardContract
     ) {
         Campaign storage campaign = campaigns[campaignId];
         return (
@@ -243,12 +205,15 @@ contract HashDropCampaign is Ownable, ReentrancyGuard {
             campaign.startTime,
             campaign.endTime,
             campaign.status,
-            campaign.rewardType
+            campaign.rewardType,
+            campaign.rewardContract
         );
     }
 
-    function getCampaignFinancialInfo(uint256 campaignId) external view validCampaign(campaignId) returns (
-        address rewardContract,
+    /**
+     * @dev Get campaign financial information
+     */
+    function getCampaignFinancials(uint256 campaignId) external view validCampaign(campaignId) returns (
         uint256 totalBudget,
         uint256 remainingBudget,
         uint256 participantCount,
@@ -256,7 +221,6 @@ contract HashDropCampaign is Ownable, ReentrancyGuard {
     ) {
         Campaign storage campaign = campaigns[campaignId];
         return (
-            campaign.rewardContract,
             campaign.totalBudget,
             campaign.remainingBudget,
             campaign.participantCount,
@@ -264,7 +228,10 @@ contract HashDropCampaign is Ownable, ReentrancyGuard {
         );
     }
 
-    function getCampaignChainInfo(uint256 campaignId) external view validCampaign(campaignId) returns (
+    /**
+     * @dev Get supported chain information
+     */
+    function getCampaignChains(uint256 campaignId) external view validCampaign(campaignId) returns (
         uint256[] memory supportedChainIds,
         bool crossChainEnabled
     ) {
@@ -275,34 +242,71 @@ contract HashDropCampaign is Ownable, ReentrancyGuard {
         );
     }
     
+    /**
+     * @dev Get vault address for a specific chain
+     */
     function getVaultAddress(uint256 campaignId, uint256 chainId) external view validCampaign(campaignId) returns (address) {
         return campaigns[campaignId].chainVaults[chainId];
     }
     
+    /**
+     * @dev Check if user has participated in campaign
+     */
     function hasUserParticipated(uint256 campaignId, address user) external view validCampaign(campaignId) returns (bool) {
         return campaigns[campaignId].hasParticipated[user];
     }
-
-    function getRewardMode(uint256 campaignId) external view validCampaign(campaignId) returns (RewardMode) {
-        return campaigns[campaignId].rewardMode;
-    }
-
-    function getMinScore(uint256 campaignId) external view validCampaign(campaignId) returns (uint256) {
-        require(campaigns[campaignId].rewardMode == RewardMode.SIMPLE, "Not a simple campaign");
-        return campaigns[campaignId].minScore;
+    
+    /**
+     * @dev Get user's score for a campaign
+     */
+    function getUserScore(uint256 campaignId, address user) external view validCampaign(campaignId) returns (uint256) {
+        require(campaigns[campaignId].hasParticipated[user], "User has not participated");
+        return campaigns[campaignId].participantScores[user];
     }
     
-    function getScoreThresholds(uint256 campaignId) external view validCampaign(campaignId) returns (
-        uint256 bronze,
-        uint256 silver,
-        uint256 gold
-    ) {
+    /**
+     * @dev Get campaigns created by a specific address
+     */
+    function getCreatorCampaigns(address creator) external view returns (uint256[] memory) {
+        return creatorCampaigns[creator];
+    }
+    
+    /**
+     * @dev Get campaign ID by hashtag
+     */
+    function getCampaignByHashtag(string memory hashtag) external view returns (uint256) {
+        uint256 campaignId = hashtagToCampaignId[hashtag];
+        require(campaignId != 0, "Campaign not found");
+        return campaignId;
+    }
+    
+    /**
+     * @dev Update campaign budget (only creator or owner)
+     */
+    function updateCampaignBudget(
+        uint256 campaignId,
+        uint256 newTotalBudget
+    ) external validCampaign(campaignId) {
         Campaign storage campaign = campaigns[campaignId];
-        require(campaign.rewardMode == RewardMode.TIERED, "Not a tiered campaign");
-        return (
-            campaign.scoreThresholds[0],
-            campaign.scoreThresholds[1],
-            campaign.scoreThresholds[2]
+        require(
+            campaign.creator == msg.sender || msg.sender == owner(),
+            "Unauthorized"
         );
+        require(newTotalBudget >= campaign.totalBudget - campaign.remainingBudget, "Cannot reduce below spent amount");
+        
+        uint256 difference = newTotalBudget - campaign.totalBudget;
+        campaign.totalBudget = newTotalBudget;
+        campaign.remainingBudget += difference;
+    }
+    
+    /**
+     * @dev Reduce remaining budget when rewards are claimed
+     */
+    function consumeBudget(uint256 campaignId, uint256 amount) external validCampaign(campaignId) {
+        Campaign storage campaign = campaigns[campaignId];
+        require(campaign.chainVaults[block.chainid] == msg.sender, "Only registered vault can consume budget");
+        require(campaign.remainingBudget >= amount, "Insufficient budget");
+        
+        campaign.remainingBudget -= amount;
     }
 }

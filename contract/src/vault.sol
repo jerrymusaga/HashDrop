@@ -15,17 +15,19 @@ contract HashDropVault is Ownable, ReentrancyGuard {
         uint256 totalRewards;
         uint256 claimedRewards;
         mapping(address => bool) hasClaimed;
+        mapping(address => uint256) userTokenIds; // Track minted token IDs for users
     }
     
     mapping(uint256 => VaultConfig) public vaultConfigs;
     mapping(address => bool) public authorizedClaimers;
     
-    event VaultConfigured(uint256 indexed campaignId, address rewardContract, uint256 totalRewards);
-    event RewardClaimed(uint256 indexed campaignId, address indexed user, uint256 tier, uint256 tokenId);
+    event VaultConfigured(uint256 indexed campaignId, address campaignContract, address rewardContract, uint256 totalRewards);
+    event RewardClaimed(uint256 indexed campaignId, address indexed user, uint256 tierId, uint256 tokenId, string tierName);
     event ClaimerAuthorized(address indexed claimer, bool authorized);
+    event VaultStatusChanged(uint256 indexed campaignId, bool active);
     
     modifier onlyAuthorizedClaimer() {
-        require(authorizedClaimers[msg.sender] || msg.sender == owner(), "Not authorized");
+        require(authorizedClaimers[msg.sender] || msg.sender == owner(), "Not authorized to process claims");
         _;
     }
 
@@ -36,6 +38,13 @@ contract HashDropVault is Ownable, ReentrancyGuard {
     
     constructor() Ownable(msg.sender) {}
 
+    /**
+     * @dev Configure vault for a campaign
+     * @param campaignId The campaign ID
+     * @param campaignContract Address of the campaign contract
+     * @param rewardContract Address of the NFT reward contract
+     * @param totalRewards Maximum number of rewards that can be claimed
+     */
     function configureVault(
         uint256 campaignId,
         address campaignContract,
@@ -44,95 +53,149 @@ contract HashDropVault is Ownable, ReentrancyGuard {
     ) external onlyOwner {
         require(campaignContract != address(0), "Invalid campaign contract");
         require(rewardContract != address(0), "Invalid reward contract");
+        require(totalRewards > 0, "Total rewards must be positive");
         
         VaultConfig storage config = vaultConfigs[campaignId];
         config.campaignContract = campaignContract;
         config.rewardContract = rewardContract;
         config.active = true;
         config.totalRewards = totalRewards;
+        config.claimedRewards = 0;
         
-        emit VaultConfigured(campaignId, rewardContract, totalRewards);
+        emit VaultConfigured(campaignId, campaignContract, rewardContract, totalRewards);
     }
     
+    /**
+     * @dev Set claimer authorization
+     */
     function setClaimerAuthorization(address claimer, bool authorized) external onlyOwner {
+        require(claimer != address(0), "Invalid claimer address");
         authorizedClaimers[claimer] = authorized;
         emit ClaimerAuthorized(claimer, authorized);
     }
 
-    function processSimpleRewardClaim(
+    /**
+     * @dev Process reward claim for a user based on their score
+     * @param campaignId The campaign ID
+     * @param user Address of the user claiming the reward
+     * @param score User's engagement score (0-100)
+     */
+    function processRewardClaim(
         uint256 campaignId,
         address user,
         uint256 score
     ) external onlyAuthorizedClaimer nonReentrant validVault(campaignId) {
         VaultConfig storage config = vaultConfigs[campaignId];
         require(config.active, "Vault not active");
-        require(!config.hasClaimed[user], "User already claimed");
+        require(!config.hasClaimed[user], "User already claimed reward");
         require(config.claimedRewards < config.totalRewards, "No rewards remaining");
+        require(score > 0 && score <= 100, "Invalid score range");
         
+        // Verify user participated in campaign
         HashDropCampaign campaignContract = HashDropCampaign(config.campaignContract);
-        HashDropCampaign.RewardMode rewardMode = campaignContract.getRewardMode(campaignId);
-        require(rewardMode == HashDropCampaign.RewardMode.SIMPLE, "Campaign not in simple mode");
+        require(campaignContract.hasUserParticipated(campaignId, user), "User has not participated");
         
-        uint256 minScore = campaignContract.getMinScore(campaignId);
-        require(score >= minScore, "Score below minimum threshold");
+        // Get stored score matches provided score
+        uint256 storedScore = campaignContract.getUserScore(campaignId, user);
+        require(storedScore == score, "Score mismatch");
         
-        // Mark as claimed
+        HashDropNFT nftContract = HashDropNFT(config.rewardContract);
+        
+        // Determine which tier the user qualifies for based on their score
+        uint256 qualifiedTierId = nftContract.determineTierForScore(campaignId, score);
+        
+        // Check if the tier is available for minting
+        require(nftContract.tierAvailable(campaignId, qualifiedTierId), "Qualified tier not available");
+        
+        // Mark as claimed before minting to prevent reentrancy
         config.hasClaimed[user] = true;
         config.claimedRewards++;
         
-        // Mint simple NFT
-        HashDropNFT nftContract = HashDropNFT(config.rewardContract);
-        require(nftContract.simpleNFTAvailable(), "Simple NFT not available");
+        // Mint the NFT
+        uint256 tokenId = nftContract.mint(user, campaignId, qualifiedTierId);
+        config.userTokenIds[user] = tokenId;
         
-        uint256 tokenId = nftContract.mintSimple(user);
+        // Get tier name for event
+        (string memory tierName,,,,,) = nftContract.getTierInfo(campaignId, qualifiedTierId);
         
-        emit RewardClaimed(campaignId, user, 0, tokenId); // tier = 0 for simple NFTs
+        // Consume budget from campaign contract
+        try campaignContract.consumeBudget(campaignId, 1) {} catch {
+            // Continue even if budget tracking fails
+        }
+        
+        emit RewardClaimed(campaignId, user, qualifiedTierId, tokenId, tierName);
     }
     
-    function processTieredRewardClaim(
+    /**
+     * @dev Batch process multiple reward claims
+     */
+    function batchProcessRewardClaims(
         uint256 campaignId,
-        address user,
-        uint256 score
-    ) external onlyAuthorizedClaimer validVault(campaignId) nonReentrant {
+        address[] memory users,
+        uint256[] memory scores
+    ) external onlyAuthorizedClaimer nonReentrant validVault(campaignId) {
+        require(users.length == scores.length, "Arrays length mismatch");
+        require(users.length > 0, "No users provided");
+        
         VaultConfig storage config = vaultConfigs[campaignId];
         require(config.active, "Vault not active");
-        require(!config.hasClaimed[user], "Already claimed");
-        require(config.claimedRewards < config.totalRewards, "No rewards left");
+        require(config.claimedRewards + users.length <= config.totalRewards, "Not enough rewards remaining");
         
         HashDropCampaign campaignContract = HashDropCampaign(config.campaignContract);
-        HashDropCampaign.RewardMode rewardMode = campaignContract.getRewardMode(campaignId);
-        require(rewardMode == HashDropCampaign.RewardMode.TIERED, "Campaign not in tiered mode");
-
-        HashDropNFT.Tier tier = _determineTier(campaignId, score);
         HashDropNFT nftContract = HashDropNFT(config.rewardContract);
         
-        require(nftContract.tierAvailable(tier), "Tier unavailable");
-        
-        unchecked {
-            config.claimedRewards++;
+        for (uint256 i = 0; i < users.length; i++) {
+            address user = users[i];
+            uint256 score = scores[i];
+            
+            // Skip if user already claimed
+            if (config.hasClaimed[user]) continue;
+            
+            // Verify participation and score
+            if (!campaignContract.hasUserParticipated(campaignId, user)) continue;
+            if (campaignContract.getUserScore(campaignId, user) != score) continue;
+            
+            try nftContract.determineTierForScore(campaignId, score) returns (uint256 qualifiedTierId) {
+                if (nftContract.tierAvailable(campaignId, qualifiedTierId)) {
+                    config.hasClaimed[user] = true;
+                    config.claimedRewards++;
+                    
+                    uint256 tokenId = nftContract.mint(user, campaignId, qualifiedTierId);
+                    config.userTokenIds[user] = tokenId;
+                    
+                    (string memory tierName,,,,,) = nftContract.getTierInfo(campaignId, qualifiedTierId);
+                    emit RewardClaimed(campaignId, user, qualifiedTierId, tokenId, tierName);
+                }
+            } catch {
+                // Skip users who don't qualify for any tier
+                continue;
+            }
         }
-        config.hasClaimed[user] = true;
         
-        uint256 tokenId = nftContract.mintTiered(user, tier);
-        emit RewardClaimed(campaignId, user, uint256(tier), tokenId);
+        // Update campaign budget
+        try campaignContract.consumeBudget(campaignId, config.claimedRewards) {} catch {}
     }
     
-    function _determineTier(uint256 campaignId, uint256 score) internal view returns (HashDropNFT.Tier) {
-        VaultConfig storage config = vaultConfigs[campaignId];
-        (uint256 bronze, uint256 silver, uint256 gold) = 
-            HashDropCampaign(config.campaignContract).getScoreThresholds(campaignId);
-
-        if (score >= gold) return HashDropNFT.Tier.GOLD;
-        if (score >= silver) return HashDropNFT.Tier.SILVER;
-        if (score >= bronze) return HashDropNFT.Tier.BRONZE;
-        revert("Score too low");
-    }
-    
+    /**
+     * @dev Check if user has claimed reward
+     */
     function hasUserClaimed(uint256 campaignId, address user) external view validVault(campaignId) returns (bool) {
         return vaultConfigs[campaignId].hasClaimed[user];
     }
     
+    /**
+     * @dev Get user's minted token ID
+     */
+    function getUserTokenId(uint256 campaignId, address user) external view validVault(campaignId) returns (uint256) {
+        require(vaultConfigs[campaignId].hasClaimed[user], "User has not claimed");
+        return vaultConfigs[campaignId].userTokenIds[user];
+    }
+    
+    /**
+     * @dev Get vault statistics
+     */
     function getVaultStats(uint256 campaignId) external view validVault(campaignId) returns (
+        address campaignContract,
         address rewardContract,
         bool active,
         uint256 totalRewards,
@@ -141,6 +204,7 @@ contract HashDropVault is Ownable, ReentrancyGuard {
     ) {
         VaultConfig storage config = vaultConfigs[campaignId];
         return (
+            config.campaignContract,
             config.rewardContract,
             config.active,
             config.totalRewards,
@@ -149,11 +213,60 @@ contract HashDropVault is Ownable, ReentrancyGuard {
         );
     }
     
-    function pauseVault(uint256 campaignId) external onlyOwner validVault(campaignId) {
-        vaultConfigs[campaignId].active = false;
+    /**
+     * @dev Preview what tier a user would qualify for
+     */
+    function previewUserTier(uint256 campaignId, address user) external view validVault(campaignId) returns (
+        uint256 tierId,
+        string memory tierName,
+        bool available
+    ) {
+        VaultConfig storage config = vaultConfigs[campaignId];
+        HashDropCampaign campaignContract = HashDropCampaign(config.campaignContract);
+        
+        require(campaignContract.hasUserParticipated(campaignId, user), "User has not participated");
+        
+        uint256 score = campaignContract.getUserScore(campaignId, user);
+        HashDropNFT nftContract = HashDropNFT(config.rewardContract);
+        
+        uint256 qualifiedTierId = nftContract.determineTierForScore(campaignId, score);
+        (string memory name,,,,,) = nftContract.getTierInfo(campaignId, qualifiedTierId);
+        bool isAvailable = nftContract.tierAvailable(campaignId, qualifiedTierId);
+        
+        return (qualifiedTierId, name, isAvailable);
     }
     
+    /**
+     * @dev Pause vault operations
+     */
+    function pauseVault(uint256 campaignId) external onlyOwner validVault(campaignId) {
+        vaultConfigs[campaignId].active = false;
+        emit VaultStatusChanged(campaignId, false);
+    }
+    
+    /**
+     * @dev Resume vault operations
+     */
     function resumeVault(uint256 campaignId) external onlyOwner validVault(campaignId) {
         vaultConfigs[campaignId].active = true;
+        emit VaultStatusChanged(campaignId, true);
+    }
+    
+    /**
+     * @dev Update vault reward limits
+     */
+    function updateVaultLimits(uint256 campaignId, uint256 newTotalRewards) external onlyOwner validVault(campaignId) {
+        VaultConfig storage config = vaultConfigs[campaignId];
+        require(newTotalRewards >= config.claimedRewards, "Cannot reduce below claimed amount");
+        
+        config.totalRewards = newTotalRewards;
+    }
+    
+    /**
+     * @dev Emergency function to update reward contract
+     */
+    function updateRewardContract(uint256 campaignId, address newRewardContract) external onlyOwner validVault(campaignId) {
+        require(newRewardContract != address(0), "Invalid reward contract");
+        vaultConfigs[campaignId].rewardContract = newRewardContract;
     }
 }
