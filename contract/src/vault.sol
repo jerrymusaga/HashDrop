@@ -5,8 +5,11 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {HashDropNFT} from "./NFT.sol";
 import {HashDropCampaign} from "./Campaign.sol";
+import {HashDropCCIPManager} from "./CCIPManager.sol";
 
 contract HashDropVault is Ownable, ReentrancyGuard {
+
+    HashDropCCIPManager public ccipManager;
     
     struct VaultConfig {
         address campaignContract;
@@ -27,9 +30,14 @@ contract HashDropVault is Ownable, ReentrancyGuard {
     event VaultStatusChanged(uint256 indexed campaignId, bool active);
     
     modifier onlyAuthorizedClaimer() {
-        require(authorizedClaimers[msg.sender] || msg.sender == owner(), "Not authorized to process claims");
-        _;
-    }
+    require(
+        authorizedClaimers[msg.sender] || 
+        msg.sender == owner() ||
+        (address(ccipManager) != address(0) && msg.sender == address(ccipManager)),
+        "Not authorized to process claims"
+    );
+    _;
+}
 
     modifier validVault(uint256 campaignId) {
         require(vaultConfigs[campaignId].rewardContract != address(0), "Vault not configured");
@@ -37,6 +45,10 @@ contract HashDropVault is Ownable, ReentrancyGuard {
     }
     
     constructor() Ownable(msg.sender) {}
+
+    function setCCIPManager(address _ccipManager) external onlyOwner {
+        ccipManager = HashDropCCIPManager(payable(_ccipManager));
+    }
 
     /**
      * @dev Configure vault for a campaign
@@ -211,6 +223,30 @@ contract HashDropVault is Ownable, ReentrancyGuard {
             config.claimedRewards,
             config.totalRewards - config.claimedRewards
         );
+    }
+
+    /**
+    * @dev Initiate cross-chain reward claim
+    */
+    function initiateXChainClaim(
+        uint256 destinationChainId,
+        uint256 campaignId,
+        address user
+    ) external onlyAuthorizedClaimer validVault(campaignId) {
+        require(address(ccipManager) != address(0), "CCIP Manager not set");
+        
+        VaultConfig storage config = vaultConfigs[campaignId];
+        require(config.active, "Vault not active");
+        require(!config.hasClaimed[user], "User already claimed reward");
+        
+        // Get user's score from campaign contract
+        HashDropCampaign campaignContract = HashDropCampaign(config.campaignContract);
+        require(campaignContract.hasUserParticipated(campaignId, user), "User has not participated");
+        
+        uint256 score = campaignContract.getUserScore(campaignId, user);
+        
+        // Send cross-chain claim request
+        ccipManager.sendRewardClaim(destinationChainId, campaignId, user, score);
     }
     
     /**
