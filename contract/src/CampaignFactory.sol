@@ -8,6 +8,21 @@ import {HashDropCampaign} from "./Campaign.sol";
 import {HashDropVault} from "./vault.sol";
 import {HashDropOracle} from "./Oracle.sol";
 
+interface IHashDropCCIPManager {
+    enum MessageType { PARTICIPATION, CLAIM_REWARD, SYNC_DATA }
+    
+    function configureChains(uint256[] calldata chainIds, uint64[] calldata chainSelectors) external;
+    function allowlistSender(address _sender, bool allowed) external;
+    function setFeeToken(address _feeToken) external;
+    function getEstimatedFee(
+        uint256 destinationChainId,
+        MessageType msgType,
+        uint256 campaignId,
+        address user,
+        uint256 score
+    ) external view returns (uint256);
+}
+
 /**
  * @title HashDropCampaignFactory with Oracle Integration
  * @dev Enhanced factory contract that includes Farcaster monitoring setup
@@ -34,6 +49,11 @@ contract HashDropCampaignFactory is Ownable, ReentrancyGuard {
         // Oracle monitoring configuration
         uint256 monitoringInterval; // seconds between Farcaster checks
         bool enableMonitoring;
+
+         // Cross-chain configuration
+        bool enableCrossChain;
+        uint256[] crossChainIds;  // Additional chains beyond supportedChainIds
+        address feeToken;         // LINK or native token for CCIP fees
     }
     
     struct MultiTierConfig {
@@ -48,6 +68,7 @@ contract HashDropCampaignFactory is Ownable, ReentrancyGuard {
         address nftContract;
         address vaultContract;
         address oracleContract;
+        address ccipManager;
     }
     
     ContractAddresses public contractAddresses;
@@ -61,6 +82,19 @@ contract HashDropCampaignFactory is Ownable, ReentrancyGuard {
     mapping(uint256 => address) public campaignCreators;
     mapping(address => uint256[]) public creatorCampaigns;
     uint256 public totalCampaignsLaunched;
+
+    event CrossChainCampaignLaunched(
+        uint256 indexed campaignId,
+        address indexed creator,
+        string hashtag,
+        uint256[] crossChainIds,
+        address feeToken
+    );
+
+    event CCIPConfigurationUpdated(
+        uint256[] chainIds,
+        uint64[] chainSelectors
+    );
     
     event CampaignLaunched(
         uint256 indexed campaignId,
@@ -89,8 +123,10 @@ contract HashDropCampaignFactory is Ownable, ReentrancyGuard {
         address _campaignContract,
         address _nftContract,
         address _vaultContract,
-        address _oracleContract
+        address _oracleContract,
+        address _ccipManager
     ) Ownable(msg.sender) {
+        require(_ccipManager != address(0), "Invalid CCIP manager contract");
         require(_campaignContract != address(0), "Invalid campaign contract");
         require(_nftContract != address(0), "Invalid NFT contract");
         require(_vaultContract != address(0), "Invalid vault contract");
@@ -100,20 +136,80 @@ contract HashDropCampaignFactory is Ownable, ReentrancyGuard {
             campaignContract: _campaignContract,
             nftContract: _nftContract,
             vaultContract: _vaultContract,
-            oracleContract: _oracleContract
+            oracleContract: _oracleContract,
+            ccipManager: _ccipManager
         });
     }
-    
+
+    /**
+    * @dev Configure CCIP for a campaign
+    */
+    function _configureCCIPForCampaign(
+        uint256 campaignId,
+        CampaignSetupParams memory params,
+        IHashDropCCIPManager ccipManager
+    ) internal {
+        // Set fee token for CCIP operations
+        if (params.feeToken != address(0)) {
+            ccipManager.setFeeToken(params.feeToken);
+        }
+        
+        // Allow this factory and campaign contract as senders
+        ccipManager.allowlistSender(address(this), true);
+        ccipManager.allowlistSender(contractAddresses.campaignContract, true);
+        ccipManager.allowlistSender(contractAddresses.vaultContract, true);
+    }
+
+    /**
+    * @dev Combine two chain ID arrays, removing duplicates
+    */
+    function _combineChainArrays(
+        uint256[] memory array1,
+        uint256[] memory array2
+    ) internal pure returns (uint256[] memory) {
+        uint256[] memory combined = new uint256[](array1.length + array2.length);
+        uint256 combinedIndex = 0;
+        
+        // Add all from first array
+        for (uint256 i = 0; i < array1.length; i++) {
+            combined[combinedIndex] = array1[i];
+            combinedIndex++;
+        }
+        
+        // Add from second array, checking for duplicates
+        for (uint256 i = 0; i < array2.length; i++) {
+            bool isDuplicate = false;
+            for (uint256 j = 0; j < array1.length; j++) {
+                if (array2[i] == array1[j]) {
+                    isDuplicate = true;
+                    break;
+                }
+            }
+            if (!isDuplicate) {
+                combined[combinedIndex] = array2[i];
+                combinedIndex++;
+            }
+        }
+        
+        // Resize array to actual length
+        uint256[] memory result = new uint256[](combinedIndex);
+        for (uint256 i = 0; i < combinedIndex; i++) {
+            result[i] = combined[i];
+        }
+        
+        return result;
+    }
+        
     /**
      * @dev Launch a complete campaign with NFT tiers, vault, and Farcaster monitoring
      * @param params All campaign setup parameters bundled together
      * @return campaignId The created campaign ID
      */
-    function launchCampaignWithMonitoring(
+    function _launchCampaignWithMonitoring(
         CampaignSetupParams memory params
-    ) public nonReentrant returns (uint256 campaignId) {
+    ) internal returns (uint256 campaignId) {
         
-        // Validate input parameters
+        // Validate input parameters (including new cross-chain params)
         _validateCampaignParams(params);
         
         // Get contract instances
@@ -121,8 +217,14 @@ contract HashDropCampaignFactory is Ownable, ReentrancyGuard {
         HashDropNFT nftContract = HashDropNFT(contractAddresses.nftContract);
         HashDropVault vaultContract = HashDropVault(contractAddresses.vaultContract);
         HashDropOracle oracleContract = HashDropOracle(contractAddresses.oracleContract);
+        IHashDropCCIPManager ccipManager = IHashDropCCIPManager(contractAddresses.ccipManager);
         
-        // Step 1: Create the campaign
+        // Combine all supported chains (original + cross-chain)
+        uint256[] memory allSupportedChains = params.enableCrossChain ? 
+            _combineChainArrays(params.supportedChainIds, params.crossChainIds) : 
+            params.supportedChainIds;
+        
+        // Step 1: Create the campaign with all supported chains
         campaignId = campaignContract.createCampaign(
             params.hashtag,
             params.description,
@@ -130,7 +232,7 @@ contract HashDropCampaignFactory is Ownable, ReentrancyGuard {
             HashDropCampaign.RewardType.NFT,
             contractAddresses.nftContract,
             params.totalBudget,
-            params.supportedChainIds
+            allSupportedChains  // Use combined chain list
         );
         
         // Step 2: Configure NFT tiers for the campaign
@@ -150,14 +252,21 @@ contract HashDropCampaignFactory is Ownable, ReentrancyGuard {
             params.totalRewards
         );
         
-        // Step 4: Register vault in campaign contract for current chain
-        campaignContract.registerVault(
-            campaignId,
-            block.chainid,
-            contractAddresses.vaultContract
-        );
+        // Step 4: Register vault on ALL supported chains
+        for (uint256 i = 0; i < allSupportedChains.length; i++) {
+            campaignContract.registerVault(
+                campaignId,
+                allSupportedChains[i],
+                contractAddresses.vaultContract
+            );
+        }
         
-        // Step 5: Set up Farcaster monitoring if enabled
+        // Step 5: Configure CCIP if cross-chain is enabled
+        if (params.enableCrossChain && params.crossChainIds.length > 0) {
+            _configureCCIPForCampaign(campaignId, params, ccipManager);
+        }
+        
+        // Step 6: Set up Farcaster monitoring if enabled
         if (params.enableMonitoring) {
             uint256 interval = params.monitoringInterval > 0 ? params.monitoringInterval : DEFAULT_MONITORING_INTERVAL;
             
@@ -169,7 +278,7 @@ contract HashDropCampaignFactory is Ownable, ReentrancyGuard {
             );
         }
         
-        // Step 6: Activate the campaign
+        // Step 7: Activate the campaign
         campaignContract.setCampaignStatus(
             campaignId,
             HashDropCampaign.CampaignStatus.ACTIVE
@@ -205,7 +314,7 @@ contract HashDropCampaignFactory is Ownable, ReentrancyGuard {
      * @param monitoringInterval How often to check Farcaster (in seconds)
      * @return campaignId The created campaign ID
      */
-    function quickLaunchFarcasterCampaign(
+    function quickLaunchCrossChainCampaign(
         string memory hashtag,
         string memory description,
         uint256 duration,
@@ -214,11 +323,14 @@ contract HashDropCampaignFactory is Ownable, ReentrancyGuard {
         uint256 maxSupply,
         uint256 totalBudget,
         uint256 totalRewards,
-        uint256 monitoringInterval
+        uint256 monitoringInterval,
+        uint256[] memory crossChainIds,
+        address feeToken
     ) external nonReentrant returns (uint256 campaignId) {
         
-        // Validate hashtag format for Farcaster
         require(_isValidHashtag(hashtag), "Invalid hashtag format - must start with #");
+        require(crossChainIds.length > 0, "Must specify cross-chain IDs");
+        require(crossChainIds.length <= 5, "Maximum 5 cross-chains allowed");
         
         // Create single-tier arrays
         string[] memory tierNames = new string[](1);
@@ -230,7 +342,7 @@ contract HashDropCampaignFactory is Ownable, ReentrancyGuard {
         tierNames[0] = tierName;
         baseURIs[0] = baseURI;
         maxSupplies[0] = maxSupply;
-        scoreThresholds[0] = 1; // Minimum score of 1 for single tier
+        scoreThresholds[0] = 1;
         supportedChainIds[0] = block.chainid;
         
         CampaignSetupParams memory params = CampaignSetupParams({
@@ -245,27 +357,33 @@ contract HashDropCampaignFactory is Ownable, ReentrancyGuard {
             scoreThresholds: scoreThresholds,
             totalRewards: totalRewards,
             monitoringInterval: monitoringInterval,
-            enableMonitoring: true
+            enableMonitoring: true,
+            enableCrossChain: true,
+            crossChainIds: crossChainIds,
+            feeToken: feeToken
         });
         
-        return this.launchCampaignWithMonitoring(params);
+        return _launchCampaignWithMonitoring(params);
     }
     
+  
     /**
-     * @dev Launch flexible multi-tier Farcaster campaign with custom tier configuration
-     * @param hashtag Campaign hashtag
-     * @param description Campaign description  
-     * @param duration Campaign duration in seconds
-     * @param totalBudget Total campaign budget
-     * @param totalRewards Total rewards available
-     * @param monitoringInterval Monitoring check interval
-     * @param tierNames Array of tier names (e.g., ["Supporter", "Champion"])
-     * @param tierURIs Array of URIs for each tier
-     * @param tierDistributions Array of percentage distributions (must sum to 100)
-     * @param tierThresholds Array of score thresholds for each tier
-     * @param tierPrefix Optional prefix for tier names
-     * @return campaignId The created campaign ID
-     */
+    * @dev Launch flexible multi-tier Farcaster campaign with custom tier configuration
+    * @param hashtag Campaign hashtag
+    * @param description Campaign description  
+    * @param duration Campaign duration in seconds
+    * @param totalBudget Total campaign budget
+    * @param totalRewards Total rewards available
+    * @param monitoringInterval Monitoring check interval
+    * @param tierNames Array of tier names (e.g., ["Supporter", "Champion"])
+    * @param tierURIs Array of URIs for each tier
+    * @param tierDistributions Array of percentage distributions (must sum to 100)
+    * @param tierThresholds Array of score thresholds for each tier
+    * @param tierPrefix Optional prefix for tier names
+    * @param crossChainIds Array of cross-chain IDs to support (can be empty)
+    * @param feeToken Fee token address for CCIP (address(0) for native token)
+    * @return campaignId The created campaign ID
+    */
     function launchMultiTierFarcasterCampaign(
         string memory hashtag,
         string memory description,
@@ -277,7 +395,9 @@ contract HashDropCampaignFactory is Ownable, ReentrancyGuard {
         string[] memory tierURIs,
         uint256[] memory tierDistributions, // Percentages (e.g., [70, 30] for 70%/30% split)
         uint256[] memory tierThresholds,
-        string memory tierPrefix
+        string memory tierPrefix,
+        uint256[] memory crossChainIds,     // Added missing parameter
+        address feeToken                    // Added missing parameter
     ) external nonReentrant returns (uint256 campaignId) {
         
         require(_isValidHashtag(hashtag), "Invalid hashtag format");
@@ -289,6 +409,15 @@ contract HashDropCampaignFactory is Ownable, ReentrancyGuard {
             tierDistributions.length == tierThresholds.length,
             "All tier arrays must have same length"
         );
+        
+        // Validate cross-chain parameters if provided
+        if (crossChainIds.length > 0) {
+            require(crossChainIds.length <= 5, "Maximum 5 cross-chains allowed");
+            // Validate that cross-chain IDs don't include current chain
+            for (uint256 i = 0; i < crossChainIds.length; i++) {
+                require(crossChainIds[i] != block.chainid, "Cannot include current chain in cross-chain list");
+            }
+        }
         
         // Validate tier parameters
         uint256 totalDistribution = 0;
@@ -341,10 +470,14 @@ contract HashDropCampaignFactory is Ownable, ReentrancyGuard {
             scoreThresholds: scoreThresholds,
             totalRewards: totalRewards,
             monitoringInterval: monitoringInterval,
-            enableMonitoring: true
+            enableMonitoring: true,
+            enableCrossChain: crossChainIds.length > 0,  // Fixed: conditional based on actual cross-chain IDs
+            crossChainIds: crossChainIds,
+            feeToken: feeToken
         });
         
-        return this.launchCampaignWithMonitoring(params);
+        // Call internal function instead of external self-call for better gas efficiency
+        return _launchCampaignWithMonitoring(params);
     }
     
     
@@ -424,17 +557,20 @@ contract HashDropCampaignFactory is Ownable, ReentrancyGuard {
         address _campaignContract,
         address _nftContract,
         address _vaultContract,
-        address _oracleContract
+        address _oracleContract,
+        address _ccipManager  
     ) external onlyOwner {
         require(_campaignContract != address(0), "Invalid campaign contract");
         require(_nftContract != address(0), "Invalid NFT contract");
         require(_vaultContract != address(0), "Invalid vault contract");
         require(_oracleContract != address(0), "Invalid oracle contract");
+        require(_ccipManager != address(0), "Invalid CCIP manager contract");
         
         contractAddresses.campaignContract = _campaignContract;
         contractAddresses.nftContract = _nftContract;
         contractAddresses.vaultContract = _vaultContract;
         contractAddresses.oracleContract = _oracleContract;
+        contractAddresses.ccipManager = _ccipManager;
         
         emit ContractAddressesUpdated(
             _campaignContract,
@@ -476,7 +612,7 @@ contract HashDropCampaignFactory is Ownable, ReentrancyGuard {
         campaignIds = new uint256[](paramsList.length);
         
         for (uint256 i = 0; i < paramsList.length; i++) {
-            campaignIds[i] = this.launchCampaignWithMonitoring(paramsList[i]);
+            campaignIds[i] = _launchCampaignWithMonitoring(paramsList[i]);
         }
         
         return campaignIds;
@@ -551,7 +687,7 @@ contract HashDropCampaignFactory is Ownable, ReentrancyGuard {
     /**
      * @dev Internal validation function
      */
-    function _validateCampaignParams(CampaignSetupParams memory params) internal pure {
+    function _validateCampaignParams(CampaignSetupParams memory params) internal view {
         require(bytes(params.hashtag).length > 0, "Hashtag cannot be empty");
         require(params.duration > 0, "Duration must be positive");
         require(params.totalBudget > 0, "Budget must be positive");
@@ -592,6 +728,20 @@ contract HashDropCampaignFactory is Ownable, ReentrancyGuard {
                 "Monitoring interval must be at least 5 minutes"
             );
         }
+        
+        // Validate cross-chain parameters
+        if (params.enableCrossChain) {
+            require(params.crossChainIds.length > 0, "Must specify cross-chain IDs when enabled");
+            require(params.crossChainIds.length <= 10, "Maximum 10 cross-chains allowed");
+            
+            // Check for duplicates in cross-chain IDs
+            for (uint256 i = 0; i < params.crossChainIds.length; i++) {
+                require(params.crossChainIds[i] != block.chainid, "Cannot include current chain in cross-chain list");
+                for (uint256 j = i + 1; j < params.crossChainIds.length; j++) {
+                    require(params.crossChainIds[i] != params.crossChainIds[j], "Duplicate cross-chain ID");
+                }
+            }
+        }
     }
     
     /**
@@ -612,6 +762,48 @@ contract HashDropCampaignFactory is Ownable, ReentrancyGuard {
             contractAddresses.nftContract != address(0) &&
             contractAddresses.vaultContract != address(0) &&
             contractAddresses.oracleContract != address(0)
+        );
+    }
+
+    /**
+    * @dev Configure CCIP chain selectors for supported chains
+    */
+    function configureCCIPChains(
+        uint256[] calldata chainIds,
+        uint64[] calldata chainSelectors
+    ) external onlyOwner {
+        require(chainIds.length == chainSelectors.length, "Arrays length mismatch");
+        
+        IHashDropCCIPManager ccipManager = IHashDropCCIPManager(contractAddresses.ccipManager);
+        ccipManager.configureChains(chainIds, chainSelectors);
+    }
+
+    /**
+    * @dev Update CCIP manager allowlist
+    */
+    function updateCCIPAllowlist(address sender, bool allowed) external onlyOwner {
+        IHashDropCCIPManager ccipManager = IHashDropCCIPManager(contractAddresses.ccipManager);
+        ccipManager.allowlistSender(sender, allowed);
+    }
+
+    /**
+    * @dev Get estimated CCIP fee for cross-chain operations
+    */
+    function getEstimatedCCIPFee(
+        uint256 destinationChainId,
+        uint256 campaignId,
+        address user,
+        uint256 score
+    ) external view returns (uint256) {
+        IHashDropCCIPManager ccipManager = IHashDropCCIPManager(contractAddresses.ccipManager);
+        
+        // Estimate fee for participation message
+        return ccipManager.getEstimatedFee(
+            destinationChainId,
+            IHashDropCCIPManager.MessageType.PARTICIPATION,
+            campaignId,
+            user,
+            score
         );
     }
 }
