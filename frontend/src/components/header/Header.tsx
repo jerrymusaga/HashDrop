@@ -27,8 +27,7 @@ const Header: React.FC = () => {
         <nav className="hidden md:flex space-x-6">
           <Link href="/" className="text-slate-300 hover:text-teal-400 transition">Home</Link>
           <Link href="/campaigns" className="text-slate-300 hover:text-teal-400 transition">Campaigns</Link>
-          <Link href="/create-campaign" className="text-slate-300 hover:text-teal-400 transition">Create Campaign</Link>
-          <Link href="/participantsDashboard" className="text-slate-300 hover:text-teal-400 transition">Dashboard</Link>
+          <Link href="/creatorsDashboard" className="text-slate-300 hover:text-teal-400 transition">Dashboard</Link>
           <Link href="/docs" className="text-slate-300 hover:text-teal-400 transition">Docs</Link>
         </nav>
 

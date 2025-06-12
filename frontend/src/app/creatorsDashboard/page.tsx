@@ -1,6 +1,5 @@
 import React from 'react'
-import CreateCampaign from '@/components/CampaignCreators-page/create-campaign'
-
+import CreateCampaign from '@/components/CampaignCreators-page/CreateCampaign'
 const CreatorsDashboard = () => {
   return (
     <div>
