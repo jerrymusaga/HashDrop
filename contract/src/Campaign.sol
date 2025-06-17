@@ -3,9 +3,11 @@ pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {HashDropCCIPManager} from "./CCIPManager.sol";
 
 contract HashDropCampaign is Ownable, ReentrancyGuard {
     uint256 private _campaignIdCounter;
+    HashDropCCIPManager public ccipManager;
     
     enum CampaignStatus { CREATED, ACTIVE, PAUSED, ENDED }
     enum RewardType { NFT, TOKEN }
@@ -57,6 +59,10 @@ contract HashDropCampaign is Ownable, ReentrancyGuard {
     }
 
     constructor() Ownable(msg.sender) {}
+
+    function setCCIPManager(address _ccipManager) external onlyOwner {
+        ccipManager = HashDropCCIPManager(payable(_ccipManager));
+    }
 
     /**
      * @dev Create a new campaign with flexible NFT tier configuration
@@ -164,7 +170,13 @@ contract HashDropCampaign is Ownable, ReentrancyGuard {
         uint256 campaignId,
         address participant,
         uint256 score
-    ) external onlyOwner nonReentrant validCampaign(campaignId) {
+    ) external nonReentrant validCampaign(campaignId) {
+        require(
+            msg.sender == owner() || 
+            (address(ccipManager) != address(0) && msg.sender == address(ccipManager)),
+            "Unauthorized"
+        );
+        
         Campaign storage campaign = campaigns[campaignId];
         require(campaign.status == CampaignStatus.ACTIVE, "Campaign not active");
         require(
@@ -178,6 +190,11 @@ contract HashDropCampaign is Ownable, ReentrancyGuard {
         campaign.hasParticipated[participant] = true;
         campaign.participantScores[participant] = score;
         campaign.participantCount++;
+        
+        // Broadcast to other chains if cross-chain enabled
+        if (campaign.crossChainEnabled && address(ccipManager) != address(0)) {
+            try ccipManager.broadcastParticipation(campaignId, participant, score) {} catch {}
+        }
         
         emit ParticipationRecorded(campaignId, participant, score);
     }

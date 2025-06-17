@@ -8,39 +8,54 @@ import {HashDropCampaign} from "./Campaign.sol";
 import {HashDropVault} from "./vault.sol";
 import {HashDropOracle} from "./Oracle.sol";
 
+interface IHashDropCCIPManager {
+    enum MessageType { PARTICIPATION, CLAIM_REWARD, SYNC_DATA }
+    
+    function configureChains(uint256[] calldata chainIds, uint64[] calldata chainSelectors) external;
+    function allowlistSender(address _sender, bool allowed) external;
+    function setFeeToken(address _feeToken) external;
+    function getEstimatedFee(
+        uint256 destinationChainId,
+        MessageType msgType,
+        uint256 campaignId,
+        address user,
+        uint256 score
+    ) external view returns (uint256);
+    function isChainSupported(uint256 chainId) external view returns (bool);
+}
+
 /**
- * @title HashDropCampaignFactory with Oracle Integration
- * @dev Enhanced factory contract that includes Farcaster monitoring setup
+ * @title HashDrop Campaign Factory - User-Friendly Version
+ * @dev Simplified factory that handles all technical complexity for users
  */
 contract HashDropCampaignFactory is Ownable, ReentrancyGuard {
     
-    struct CampaignSetupParams {
-        // Campaign parameters
-        string hashtag;
-        string description;
-        uint256 duration;
-        uint256 totalBudget;
-        uint256[] supportedChainIds;
-        
-        // NFT Tier configuration
-        string[] tierNames;
-        string[] baseURIs;
-        uint256[] maxSupplies;
-        uint256[] scoreThresholds;
-        
-        // Vault configuration
-        uint256 totalRewards;
-        
-        // Oracle monitoring configuration
-        uint256 monitoringInterval; // seconds between Farcaster checks
-        bool enableMonitoring;
+    // Simplified user input - no technical CCIP details needed
+    struct SimpleCampaignParams {
+        string hashtag;              // #myhashtag
+        string description;          // Campaign description
+        uint256 durationDays;        // Duration in days (more user-friendly)
+        uint256 nftRewardCount;      // How many NFTs to give out
+        string nftName;              // NFT collection name
+        string nftImageURL;          // Single image URL for NFTs
+        bool enableMultiChain;       // Simple on/off for cross-chain
     }
     
-    struct MultiTierConfig {
-        string bronzeURI;
-        string silverURI;
-        string goldURI;
-        string tierPrefix; // Optional prefix for tier names (e.g., campaign name)
+    // Advanced users can still customize if needed
+    struct AdvancedCampaignParams {
+        SimpleCampaignParams basic;
+        
+        // Optional tier customization
+        string[] tierNames;          // ["Bronze", "Silver", "Gold"] 
+        string[] tierImageURLs;      // Different images per tier
+        uint256[] tierDistribution;  // [70, 25, 5] = 70% bronze, 25% silver, 5% gold
+        uint256[] tierThresholds;    // [1, 5, 20] = min engagement scores
+        
+        // Optional chain selection (defaults to popular chains)
+        uint256[] specificChains;    // If empty, uses default popular chains
+        
+        // Optional monitoring settings
+        uint256 monitoringHours;     // How often to check (defaults to 1 hour)
     }
     
     struct ContractAddresses {
@@ -48,73 +63,252 @@ contract HashDropCampaignFactory is Ownable, ReentrancyGuard {
         address nftContract;
         address vaultContract;
         address oracleContract;
+        address ccipManager;
+        address feeToken;            // LINK token for CCIP fees
     }
     
     ContractAddresses public contractAddresses;
     
-    // Default monitoring interval (1 hour)
-    uint256 public constant DEFAULT_MONITORING_INTERVAL = 3600;
-    // Minimum monitoring interval (5 minutes)
-    uint256 public constant MIN_MONITORING_INTERVAL = 300;
+    // Default supported chains (popular L2s that users actually use)
+    uint256[] public defaultSupportedChains;
+    mapping(uint256 => bool) public supportedChains;
     
-    // Track launched campaigns
+    // Cost calculation constants
+    uint256 public constant BASE_COST_PER_NFT = 0.001 ether;      // Base cost per NFT
+    uint256 public constant MULTICHAIN_MULTIPLIER = 150;          // 1.5x cost for multichain
+    uint256 public constant MONITORING_COST_PER_DAY = 0.01 ether; // Daily monitoring cost
+    
+    // Default configurations
+    uint256 public constant DEFAULT_MONITORING_HOURS = 1;
+    uint256 public constant MAX_CAMPAIGN_DAYS = 365;
+    uint256 public constant MIN_CAMPAIGN_DAYS = 1;
+    uint256 public constant MAX_NFT_REWARDS = 10000;
+    
+    // Track campaigns
     mapping(uint256 => address) public campaignCreators;
     mapping(address => uint256[]) public creatorCampaigns;
     uint256 public totalCampaignsLaunched;
     
-    event CampaignLaunched(
+    event SimpleCampaignLaunched(
+        uint256 indexed campaignId,
+        address indexed creator,
+        string hashtag,
+        uint256 nftCount,
+        bool multiChain,
+        uint256 totalCost
+    );
+    
+    event AdvancedCampaignLaunched(
         uint256 indexed campaignId,
         address indexed creator,
         string hashtag,
         uint256 tierCount,
-        bool isMultiTier,
-        bool monitoringEnabled
-    );
-    
-    event ContractAddressesUpdated(
-        address campaignContract,
-        address nftContract,
-        address vaultContract,
-        address oracleContract
-    );
-    
-    event MonitoringConfigured(
-        uint256 indexed campaignId,
-        string hashtag,
-        uint256 interval,
-        bool enabled
+        uint256[] chainIds,
+        uint256 totalCost
     );
     
     constructor(
         address _campaignContract,
         address _nftContract,
         address _vaultContract,
-        address _oracleContract
+        address _oracleContract,
+        address _ccipManager,
+        address _feeToken
     ) Ownable(msg.sender) {
         require(_campaignContract != address(0), "Invalid campaign contract");
         require(_nftContract != address(0), "Invalid NFT contract");
         require(_vaultContract != address(0), "Invalid vault contract");
         require(_oracleContract != address(0), "Invalid oracle contract");
+        require(_ccipManager != address(0), "Invalid CCIP manager");
+        require(_feeToken != address(0), "Invalid fee token");
         
         contractAddresses = ContractAddresses({
             campaignContract: _campaignContract,
             nftContract: _nftContract,
             vaultContract: _vaultContract,
-            oracleContract: _oracleContract
+            oracleContract: _oracleContract,
+            ccipManager: _ccipManager,
+            feeToken: _feeToken
         });
+        
+        // Set up default popular chains (Polygon, Arbitrum, Optimism, Base)
+        _initializeDefaultChains();
     }
     
     /**
-     * @dev Launch a complete campaign with NFT tiers, vault, and Farcaster monitoring
-     * @param params All campaign setup parameters bundled together
-     * @return campaignId The created campaign ID
+     * @dev Initialize default supported chains with popular L2s
      */
-    function launchCampaignWithMonitoring(
-        CampaignSetupParams memory params
-    ) public nonReentrant returns (uint256 campaignId) {
+    function _initializeDefaultChains() internal {
+        // Popular L2 chains that users actually use
+        defaultSupportedChains = [
+            137,    // Polygon
+            42161,  // Arbitrum One  
+            10,     // Optimism
+            8453,   // Base
+            43114   // Avalanche
+        ];
         
-        // Validate input parameters
-        _validateCampaignParams(params);
+        for (uint256 i = 0; i < defaultSupportedChains.length; i++) {
+            supportedChains[defaultSupportedChains[i]] = true;
+        }
+    }
+    
+    /**
+     * @dev Calculate total campaign cost for user
+     * @param nftCount Number of NFTs to distribute
+     * @param durationDays Campaign duration in days
+     * @param multiChain Whether to enable multichain
+     * @return totalCost Total cost in ETH
+     */
+    function calculateCampaignCost(
+        uint256 nftCount,
+        uint256 durationDays,
+        bool multiChain
+    ) public pure returns (uint256 totalCost) {
+        require(nftCount > 0 && nftCount <= MAX_NFT_REWARDS, "Invalid NFT count");
+        require(durationDays >= MIN_CAMPAIGN_DAYS && durationDays <= MAX_CAMPAIGN_DAYS, "Invalid duration");
+        
+        // Base cost: number of NFTs * base cost
+        totalCost = nftCount * BASE_COST_PER_NFT;
+        
+        // Multichain premium (50% more)
+        if (multiChain) {
+            totalCost = totalCost * MULTICHAIN_MULTIPLIER / 100;
+        }
+        
+        // Monitoring cost (daily)
+        totalCost += durationDays * MONITORING_COST_PER_DAY;
+        
+        return totalCost;
+    }
+    
+    /**
+     * @dev Get cost estimate without creating campaign
+     */
+    function getCostEstimate(
+        uint256 nftCount,
+        uint256 durationDays,
+        bool multiChain
+    ) external pure returns (
+        uint256 totalCost,
+        uint256 nftCost,
+        uint256 multichainPremium,
+        uint256 monitoringCost
+    ) {
+        nftCost = nftCount * BASE_COST_PER_NFT;
+        multichainPremium = multiChain ? (nftCost * 50 / 100) : 0;
+        monitoringCost = durationDays * MONITORING_COST_PER_DAY;
+        totalCost = nftCost + multichainPremium + monitoringCost;
+        
+        return (totalCost, nftCost, multichainPremium, monitoringCost);
+    }
+    
+    /**
+     * @dev Super simple campaign launch - just the essentials!
+     * Users only need: hashtag, description, duration, NFT count, NFT name, image
+     * Everything else is handled automatically
+     */
+    function launchSimpleCampaign(
+        string memory hashtag,           // "#mycampaign"
+        string memory description,       // "My awesome campaign"
+        uint256 durationDays,           // 30 (days)
+        uint256 nftRewardCount,         // 1000 (NFTs to give out)
+        string memory nftName,          // "My Campaign NFT"
+        string memory nftImageURL,      // "https://myimage.com/nft.png"
+        bool enableMultiChain           // true/false
+    ) external payable nonReentrant returns (uint256 campaignId) {
+        
+        // Validate inputs
+        require(_isValidHashtag(hashtag), "Invalid hashtag - must start with # and contain only letters/numbers");
+        require(bytes(description).length > 0, "Description cannot be empty");
+        require(bytes(nftName).length > 0, "NFT name cannot be empty");
+        require(bytes(nftImageURL).length > 0, "NFT image URL cannot be empty");
+        require(durationDays >= MIN_CAMPAIGN_DAYS && durationDays <= MAX_CAMPAIGN_DAYS, "Duration must be 1-365 days");
+        require(nftRewardCount > 0 && nftRewardCount <= MAX_NFT_REWARDS, "NFT count must be 1-10,000");
+        
+        // Calculate required payment
+        uint256 requiredCost = calculateCampaignCost(nftRewardCount, durationDays, enableMultiChain);
+        require(msg.value >= requiredCost, "Insufficient payment");
+        
+        // Build campaign parameters automatically
+        SimpleCampaignParams memory params = SimpleCampaignParams({
+            hashtag: hashtag,
+            description: description,
+            durationDays: durationDays,
+            nftRewardCount: nftRewardCount,
+            nftName: nftName,
+            nftImageURL: nftImageURL,
+            enableMultiChain: enableMultiChain
+        });
+        
+        // Launch the campaign with auto-configuration
+        campaignId = _executeSimpleCampaignLaunch(params);
+        
+        // Refund excess payment
+        if (msg.value > requiredCost) {
+            payable(msg.sender).transfer(msg.value - requiredCost);
+        }
+        
+        emit SimpleCampaignLaunched(
+            campaignId,
+            msg.sender,
+            hashtag,
+            nftRewardCount,
+            enableMultiChain,
+            requiredCost
+        );
+        
+        return campaignId;
+    }
+    
+    /**
+     * @dev Advanced campaign launch for users who want more control
+     */
+    function launchAdvancedCampaign(
+        AdvancedCampaignParams memory params
+    ) external payable nonReentrant returns (uint256 campaignId) {
+        
+        // Validate basic parameters
+        _validateAdvancedParams(params);
+        
+        // Calculate cost based on configuration
+        uint256 totalNFTs = params.basic.nftRewardCount;
+        bool isMultiChain = params.basic.enableMultiChain || params.specificChains.length > 1;
+        uint256 requiredCost = calculateCampaignCost(totalNFTs, params.basic.durationDays, isMultiChain);
+        
+        require(msg.value >= requiredCost, "Insufficient payment");
+        
+        // Execute advanced campaign launch
+        campaignId = _executeAdvancedCampaignLaunch(params);
+        
+        // Refund excess
+        if (msg.value > requiredCost) {
+            payable(msg.sender).transfer(msg.value - requiredCost);
+        }
+        
+        // Determine final chain configuration
+        uint256[] memory finalChains = params.specificChains.length > 0 ? 
+            params.specificChains : 
+            (isMultiChain ? defaultSupportedChains : _getCurrentChainArray());
+        
+        emit AdvancedCampaignLaunched(
+            campaignId,
+            msg.sender,
+            params.basic.hashtag,
+            params.tierNames.length > 0 ? params.tierNames.length : 1,
+            finalChains,
+            requiredCost
+        );
+        
+        return campaignId;
+    }
+    
+    /**
+     * @dev Execute simple campaign launch with auto-configuration
+     */
+    function _executeSimpleCampaignLaunch(
+        SimpleCampaignParams memory params
+    ) internal returns (uint256 campaignId) {
         
         // Get contract instances
         HashDropCampaign campaignContract = HashDropCampaign(contractAddresses.campaignContract);
@@ -122,417 +316,316 @@ contract HashDropCampaignFactory is Ownable, ReentrancyGuard {
         HashDropVault vaultContract = HashDropVault(contractAddresses.vaultContract);
         HashDropOracle oracleContract = HashDropOracle(contractAddresses.oracleContract);
         
-        // Step 1: Create the campaign
+        // Determine chain configuration automatically
+        uint256[] memory supportedChainIds = params.enableMultiChain ? 
+            defaultSupportedChains : 
+            _getCurrentChainArray();
+        
+        // Auto-configure CCIP if multichain
+        if (params.enableMultiChain) {
+            _autoConfigureCCIP();
+        }
+        
+        // Create campaign with auto-calculated budget
+        uint256 totalBudget = _calculateAutoBudget(params.nftRewardCount, params.durationDays);
         campaignId = campaignContract.createCampaign(
             params.hashtag,
             params.description,
-            params.duration,
+            params.durationDays * 1 days, // Convert days to seconds
             HashDropCampaign.RewardType.NFT,
             contractAddresses.nftContract,
-            params.totalBudget,
-            params.supportedChainIds
+            totalBudget,
+            supportedChainIds
         );
         
-        // Step 2: Configure NFT tiers for the campaign
+        // Configure single-tier NFT (most users want simple single NFT)
+        string[] memory tierNames = new string[](1);
+        string[] memory baseURIs = new string[](1);
+        uint256[] memory maxSupplies = new uint256[](1);
+        uint256[] memory scoreThresholds = new uint256[](1);
+        
+        tierNames[0] = params.nftName;
+        baseURIs[0] = params.nftImageURL;
+        maxSupplies[0] = params.nftRewardCount;
+        scoreThresholds[0] = 1; // Anyone who participates gets NFT
+        
         nftContract.configureCampaign(
             campaignId,
-            params.tierNames,
-            params.baseURIs,
-            params.maxSupplies,
-            params.scoreThresholds
+            tierNames,
+            baseURIs,
+            maxSupplies,
+            scoreThresholds
         );
         
-        // Step 3: Configure vault for the campaign
+        // Configure vault
         vaultContract.configureVault(
             campaignId,
             contractAddresses.campaignContract,
             contractAddresses.nftContract,
-            params.totalRewards
+            params.nftRewardCount
         );
         
-        // Step 4: Register vault in campaign contract for current chain
-        campaignContract.registerVault(
-            campaignId,
-            block.chainid,
-            contractAddresses.vaultContract
-        );
-        
-        // Step 5: Set up Farcaster monitoring if enabled
-        if (params.enableMonitoring) {
-            uint256 interval = params.monitoringInterval > 0 ? params.monitoringInterval : DEFAULT_MONITORING_INTERVAL;
-            
-            oracleContract.startCampaignMonitoring(
+        // Register vault on all chains
+        for (uint256 i = 0; i < supportedChainIds.length; i++) {
+            campaignContract.registerVault(
                 campaignId,
-                params.hashtag,
-                contractAddresses.campaignContract,
-                interval
+                supportedChainIds[i],
+                contractAddresses.vaultContract
             );
         }
         
-        // Step 6: Activate the campaign
+        // Start automatic Farcaster monitoring
+        oracleContract.startCampaignMonitoring(
+            campaignId,
+            params.hashtag,
+            contractAddresses.campaignContract,
+            DEFAULT_MONITORING_HOURS * 1 hours
+        );
+        
+        // Activate campaign
         campaignContract.setCampaignStatus(
             campaignId,
             HashDropCampaign.CampaignStatus.ACTIVE
         );
         
-        // Track campaign creation
+        // Track campaign
         campaignCreators[campaignId] = msg.sender;
         creatorCampaigns[msg.sender].push(campaignId);
         totalCampaignsLaunched++;
-        
-        emit CampaignLaunched(
-            campaignId,
-            msg.sender,
-            params.hashtag,
-            params.tierNames.length,
-            params.tierNames.length > 1,
-            params.enableMonitoring
-        );
         
         return campaignId;
     }
     
     /**
-     * @dev Quick launch for Farcaster campaigns with automatic monitoring
-     * @param hashtag Campaign hashtag (must include # symbol)
-     * @param description Campaign description
-     * @param duration Campaign duration in seconds
-     * @param tierName Name of the single tier
-     * @param baseURI Base URI for NFT metadata
-     * @param maxSupply Maximum supply for the tier
-     * @param totalBudget Total campaign budget
-     * @param totalRewards Total rewards available
-     * @param monitoringInterval How often to check Farcaster (in seconds)
-     * @return campaignId The created campaign ID
+     * @dev Execute advanced campaign launch
      */
-    function quickLaunchFarcasterCampaign(
-        string memory hashtag,
-        string memory description,
-        uint256 duration,
-        string memory tierName,
-        string memory baseURI,
-        uint256 maxSupply,
-        uint256 totalBudget,
-        uint256 totalRewards,
-        uint256 monitoringInterval
-    ) external nonReentrant returns (uint256 campaignId) {
+    function _executeAdvancedCampaignLaunch(
+        AdvancedCampaignParams memory params
+    ) internal returns (uint256 campaignId) {
+        // Implementation similar to simple launch but with custom tiers, chains, etc.
+        // This is for power users who want more control
         
-        // Validate hashtag format for Farcaster
-        require(_isValidHashtag(hashtag), "Invalid hashtag format - must start with #");
+        // Get contract instances
+        HashDropCampaign campaignContract = HashDropCampaign(contractAddresses.campaignContract);
+        HashDropNFT nftContract = HashDropNFT(contractAddresses.nftContract);
+        HashDropVault vaultContract = HashDropVault(contractAddresses.vaultContract);
+        HashDropOracle oracleContract = HashDropOracle(contractAddresses.oracleContract);
         
-        // Create single-tier arrays
+        // Use custom chains or defaults
+        uint256[] memory supportedChainIds = params.specificChains.length > 0 ? 
+            params.specificChains : 
+            (params.basic.enableMultiChain ? defaultSupportedChains : _getCurrentChainArray());
+        
+        // Auto-configure CCIP for multichain
+        if (supportedChainIds.length > 1) {
+            _autoConfigureCCIP();
+        }
+        
+        // Create campaign
+        uint256 totalBudget = _calculateAutoBudget(params.basic.nftRewardCount, params.basic.durationDays);
+        campaignId = campaignContract.createCampaign(
+            params.basic.hashtag,
+            params.basic.description,
+            params.basic.durationDays * 1 days,
+            HashDropCampaign.RewardType.NFT,
+            contractAddresses.nftContract,
+            totalBudget,
+            supportedChainIds
+        );
+        
+        // Configure tiers (custom or default)
+        if (params.tierNames.length > 0) {
+            // Use custom tier configuration
+            _configureCustomTiers(campaignId, params, nftContract);
+        } else {
+            // Use simple single-tier configuration
+            _configureSimpleTier(campaignId, params.basic, nftContract);
+        }
+        
+        // Configure vault and monitoring (similar to simple launch)
+        vaultContract.configureVault(
+            campaignId,
+            contractAddresses.campaignContract,
+            contractAddresses.nftContract,
+            params.basic.nftRewardCount
+        );
+        
+        // Register vault on all chains
+        for (uint256 i = 0; i < supportedChainIds.length; i++) {
+            campaignContract.registerVault(
+                campaignId,
+                supportedChainIds[i],
+                contractAddresses.vaultContract
+            );
+        }
+        
+        // Start monitoring with custom interval
+        uint256 monitoringInterval = params.monitoringHours > 0 ? 
+            params.monitoringHours * 1 hours : 
+            DEFAULT_MONITORING_HOURS * 1 hours;
+            
+        oracleContract.startCampaignMonitoring(
+            campaignId,
+            params.basic.hashtag,
+            contractAddresses.campaignContract,
+            monitoringInterval
+        );
+        
+        // Activate campaign
+        campaignContract.setCampaignStatus(
+            campaignId,
+            HashDropCampaign.CampaignStatus.ACTIVE
+        );
+        
+        // Track campaign
+        campaignCreators[campaignId] = msg.sender;
+        creatorCampaigns[msg.sender].push(campaignId);
+        totalCampaignsLaunched++;
+        
+        return campaignId;
+    }
+    
+    /**
+     * @dev Auto-configure CCIP settings (hidden from users)
+     */
+    function _autoConfigureCCIP() internal {
+        IHashDropCCIPManager ccipManager = IHashDropCCIPManager(contractAddresses.ccipManager);
+        
+        // Set LINK as fee token automatically
+        ccipManager.setFeeToken(contractAddresses.feeToken);
+        
+        // Allow necessary contracts
+        ccipManager.allowlistSender(address(this), true);
+        ccipManager.allowlistSender(contractAddresses.campaignContract, true);
+        ccipManager.allowlistSender(contractAddresses.vaultContract, true);
+    }
+    
+    /**
+     * @dev Calculate budget automatically based on NFT count and duration
+     */
+    function _calculateAutoBudget(uint256 nftCount, uint256 durationDays) internal pure returns (uint256) {
+        // Simple budget calculation - in real implementation this would be more sophisticated
+        return nftCount * 1000 + (durationDays * 100);
+    }
+    
+    /**
+     * @dev Get current chain as single-element array
+     */
+    function _getCurrentChainArray() internal view returns (uint256[] memory) {
+        uint256[] memory currentChain = new uint256[](1);
+        currentChain[0] = block.chainid;
+        return currentChain;
+    }
+    
+    /**
+     * @dev Configure custom tiers for advanced users
+     */
+    function _configureCustomTiers(
+        uint256 campaignId,
+        AdvancedCampaignParams memory params,
+        HashDropNFT nftContract
+    ) internal {
+        // Distribute NFTs according to tier percentages
+        uint256[] memory maxSupplies = new uint256[](params.tierNames.length);
+        for (uint256 i = 0; i < params.tierNames.length; i++) {
+            maxSupplies[i] = params.basic.nftRewardCount * params.tierDistribution[i] / 100;
+        }
+        
+        nftContract.configureCampaign(
+            campaignId,
+            params.tierNames,
+            params.tierImageURLs.length > 0 ? params.tierImageURLs : _createDefaultImageArray(params.basic.nftImageURL, params.tierNames.length),
+            maxSupplies,
+            params.tierThresholds
+        );
+    }
+    
+    /**
+     * @dev Configure simple single tier
+     */
+    function _configureSimpleTier(
+        uint256 campaignId,
+        SimpleCampaignParams memory params,
+        HashDropNFT nftContract
+    ) internal {
         string[] memory tierNames = new string[](1);
         string[] memory baseURIs = new string[](1);
         uint256[] memory maxSupplies = new uint256[](1);
         uint256[] memory scoreThresholds = new uint256[](1);
-        uint256[] memory supportedChainIds = new uint256[](1);
         
-        tierNames[0] = tierName;
-        baseURIs[0] = baseURI;
-        maxSupplies[0] = maxSupply;
-        scoreThresholds[0] = 1; // Minimum score of 1 for single tier
-        supportedChainIds[0] = block.chainid;
+        tierNames[0] = params.nftName;
+        baseURIs[0] = params.nftImageURL;
+        maxSupplies[0] = params.nftRewardCount;
+        scoreThresholds[0] = 1;
         
-        CampaignSetupParams memory params = CampaignSetupParams({
-            hashtag: hashtag,
-            description: description,
-            duration: duration,
-            totalBudget: totalBudget,
-            supportedChainIds: supportedChainIds,
-            tierNames: tierNames,
-            baseURIs: baseURIs,
-            maxSupplies: maxSupplies,
-            scoreThresholds: scoreThresholds,
-            totalRewards: totalRewards,
-            monitoringInterval: monitoringInterval,
-            enableMonitoring: true
-        });
-        
-        return this.launchCampaignWithMonitoring(params);
-    }
-    
-    /**
-     * @dev Launch flexible multi-tier Farcaster campaign with custom tier configuration
-     * @param hashtag Campaign hashtag
-     * @param description Campaign description  
-     * @param duration Campaign duration in seconds
-     * @param totalBudget Total campaign budget
-     * @param totalRewards Total rewards available
-     * @param monitoringInterval Monitoring check interval
-     * @param tierNames Array of tier names (e.g., ["Supporter", "Champion"])
-     * @param tierURIs Array of URIs for each tier
-     * @param tierDistributions Array of percentage distributions (must sum to 100)
-     * @param tierThresholds Array of score thresholds for each tier
-     * @param tierPrefix Optional prefix for tier names
-     * @return campaignId The created campaign ID
-     */
-    function launchMultiTierFarcasterCampaign(
-        string memory hashtag,
-        string memory description,
-        uint256 duration,
-        uint256 totalBudget,
-        uint256 totalRewards,
-        uint256 monitoringInterval,
-        string[] memory tierNames,
-        string[] memory tierURIs,
-        uint256[] memory tierDistributions, // Percentages (e.g., [70, 30] for 70%/30% split)
-        uint256[] memory tierThresholds,
-        string memory tierPrefix
-    ) external nonReentrant returns (uint256 campaignId) {
-        
-        require(_isValidHashtag(hashtag), "Invalid hashtag format");
-        require(tierNames.length >= 1, "Must have at least 1 tier");
-        require(tierNames.length <= 10, "Maximum 10 tiers allowed");
-        require(
-            tierNames.length == tierURIs.length && 
-            tierURIs.length == tierDistributions.length && 
-            tierDistributions.length == tierThresholds.length,
-            "All tier arrays must have same length"
-        );
-        
-        // Validate tier parameters
-        uint256 totalDistribution = 0;
-        for (uint256 i = 0; i < tierNames.length; i++) {
-            require(bytes(tierNames[i]).length > 0, "Tier name cannot be empty");
-            require(bytes(tierURIs[i]).length > 0, "Tier URI cannot be empty");
-            require(tierDistributions[i] > 0, "Tier distribution must be positive");
-            require(tierThresholds[i] <= 100, "Score threshold cannot exceed 100");
-            totalDistribution += tierDistributions[i];
-        }
-        require(totalDistribution == 100, "Tier distributions must sum to 100");
-        
-        // Validate thresholds are ascending for multi-tier campaigns
-        if (tierNames.length > 1) {
-            for (uint256 i = 1; i < tierThresholds.length; i++) {
-                require(tierThresholds[i-1] < tierThresholds[i], "Thresholds must be ascending");
-            }
-        }
-        
-        // Build tier configuration
-        string[] memory finalTierNames = new string[](tierNames.length);
-        string[] memory baseURIs = new string[](tierNames.length);
-        uint256[] memory maxSupplies = new uint256[](tierNames.length);
-        uint256[] memory scoreThresholds = new uint256[](tierNames.length);
-        uint256[] memory supportedChainIds = new uint256[](1);
-        
-        // Use provided prefix or default to hashtag for tier names
-        string memory prefix = bytes(tierPrefix).length > 0 ? 
-            tierPrefix : 
-            _removeHashSymbol(hashtag);
-        
-        for (uint256 i = 0; i < tierNames.length; i++) {
-            finalTierNames[i] = string(abi.encodePacked(prefix, " ", tierNames[i]));
-            baseURIs[i] = tierURIs[i];
-            maxSupplies[i] = totalRewards * tierDistributions[i] / 100;
-            scoreThresholds[i] = tierThresholds[i];
-        }
-        
-        supportedChainIds[0] = block.chainid;
-        
-        CampaignSetupParams memory params = CampaignSetupParams({
-            hashtag: hashtag,
-            description: description,
-            duration: duration,
-            totalBudget: totalBudget,
-            supportedChainIds: supportedChainIds,
-            tierNames: finalTierNames,
-            baseURIs: baseURIs,
-            maxSupplies: maxSupplies,
-            scoreThresholds: scoreThresholds,
-            totalRewards: totalRewards,
-            monitoringInterval: monitoringInterval,
-            enableMonitoring: true
-        });
-        
-        return this.launchCampaignWithMonitoring(params);
-    }
-    
-    
-    /**
-     * @dev Enable monitoring for an existing campaign
-     * @param campaignId The campaign ID
-     * @param hashtag The hashtag to monitor
-     * @param monitoringInterval Check interval in seconds
-     */
-    function enableCampaignMonitoring(
-        uint256 campaignId,
-        string memory hashtag,
-        uint256 monitoringInterval
-    ) external onlyOwner {
-        require(_isValidHashtag(hashtag), "Invalid hashtag format");
-        
-        HashDropOracle oracleContract = HashDropOracle(contractAddresses.oracleContract);
-        
-        uint256 interval = monitoringInterval > 0 ? 
-            monitoringInterval : DEFAULT_MONITORING_INTERVAL;
-        
-        oracleContract.startCampaignMonitoring(
+        nftContract.configureCampaign(
             campaignId,
-            hashtag,
-            contractAddresses.campaignContract,
-            interval
-        );
-        
-        emit MonitoringConfigured(campaignId, hashtag, interval, true);
-    }
-    
-    /**
-     * @dev Disable monitoring for a campaign
-     * @param campaignId The campaign ID
-     */
-    function disableCampaignMonitoring(uint256 campaignId) external onlyOwner {
-        HashDropOracle oracleContract = HashDropOracle(contractAddresses.oracleContract);
-        oracleContract.stopCampaignMonitoring(campaignId);
-        
-        emit MonitoringConfigured(campaignId, "", 0, false);
-    }
-    
-    /**
-     * @dev Get campaign monitoring status
-     * @param campaignId The campaign ID
-     */
-    function getCampaignMonitoringStatus(uint256 campaignId) external view returns (
-        string memory hashtag,
-        bool active,
-        uint256 lastUpdateTime,
-        uint256 checkInterval,
-        uint256 trackedUserCount
-    ) {
-        HashDropOracle oracleContract = HashDropOracle(contractAddresses.oracleContract);
-        
-        (
-            hashtag,
-            ,
-            active,
-            lastUpdateTime,
-            checkInterval,
-            ,
-            trackedUserCount
-        ) = oracleContract.getCampaignMonitorStatus(campaignId);
-        
-        return (hashtag, active, lastUpdateTime, checkInterval, trackedUserCount);
-    }
-    
-    /**
-     * @dev Update contract addresses (only owner)
-     * @param _campaignContract New campaign contract address
-     * @param _nftContract New NFT contract address
-     * @param _vaultContract New vault contract address
-     * @param _oracleContract New oracle contract address
-     */
-    function updateContractAddresses(
-        address _campaignContract,
-        address _nftContract,
-        address _vaultContract,
-        address _oracleContract
-    ) external onlyOwner {
-        require(_campaignContract != address(0), "Invalid campaign contract");
-        require(_nftContract != address(0), "Invalid NFT contract");
-        require(_vaultContract != address(0), "Invalid vault contract");
-        require(_oracleContract != address(0), "Invalid oracle contract");
-        
-        contractAddresses.campaignContract = _campaignContract;
-        contractAddresses.nftContract = _nftContract;
-        contractAddresses.vaultContract = _vaultContract;
-        contractAddresses.oracleContract = _oracleContract;
-        
-        emit ContractAddressesUpdated(
-            _campaignContract,
-            _nftContract,
-            _vaultContract,
-            _oracleContract
+            tierNames,
+            baseURIs,
+            maxSupplies,
+            scoreThresholds
         );
     }
     
     /**
-     * @dev Get campaigns created by a specific creator
-     * @param creator The creator address
-     * @return Array of campaign IDs created by the creator
+     * @dev Create default image array when user doesn't provide tier-specific images
      */
-    function getCreatorCampaigns(address creator) external view returns (uint256[] memory) {
-        return creatorCampaigns[creator];
-    }
-    
-    /**
-     * @dev Get campaign creator
-     * @param campaignId The campaign ID
-     * @return The address of the campaign creator
-     */
-    function getCampaignCreator(uint256 campaignId) external view returns (address) {
-        return campaignCreators[campaignId];
-    }
-    
-    /**
-     * @dev Batch launch multiple campaigns
-     * @param paramsList Array of campaign setup parameters
-     * @return campaignIds Array of created campaign IDs
-     */
-    function batchLaunchCampaigns(
-        CampaignSetupParams[] memory paramsList
-    ) external nonReentrant returns (uint256[] memory campaignIds) {
-        require(paramsList.length > 0, "No campaigns to launch");
-        require(paramsList.length <= 10, "Maximum 10 campaigns per batch");
-        
-        campaignIds = new uint256[](paramsList.length);
-        
-        for (uint256 i = 0; i < paramsList.length; i++) {
-            campaignIds[i] = this.launchCampaignWithMonitoring(paramsList[i]);
+    function _createDefaultImageArray(string memory baseImage, uint256 length) internal pure returns (string[] memory) {
+        string[] memory images = new string[](length);
+        for (uint256 i = 0; i < length; i++) {
+            images[i] = baseImage;
         }
+        return images;
+    }
+    
+    /**
+     * @dev Validate advanced campaign parameters
+     */
+    function _validateAdvancedParams(AdvancedCampaignParams memory params) internal view {
+        // Validate basic params
+        require(_isValidHashtag(params.basic.hashtag), "Invalid hashtag");
+        require(bytes(params.basic.description).length > 0, "Description required");
+        require(params.basic.durationDays >= MIN_CAMPAIGN_DAYS && params.basic.durationDays <= MAX_CAMPAIGN_DAYS, "Invalid duration");
+        require(params.basic.nftRewardCount > 0 && params.basic.nftRewardCount <= MAX_NFT_REWARDS, "Invalid NFT count");
         
-        return campaignIds;
-    }
-    
-    /**
-     * @dev Get factory statistics
-     * @return totalCampaigns Total campaigns launched
-     * @return totalCreators Number of unique creators
-     * @return contractAddrs Current contract addresses
-     */
-    function getFactoryStats() external view returns (
-        uint256 totalCampaigns,
-        uint256 totalCreators,
-        ContractAddresses memory contractAddrs
-    ) {
-        // Note: totalCreators would require additional tracking in a real implementation
-        return (totalCampaignsLaunched, 0, contractAddresses);
-    }
-    
-    /**
-     * @dev Remove # symbol from hashtag for use in tier names
-     * @param hashtag The hashtag string
-     * @return cleanTag The hashtag without the # symbol
-     */
-    function _removeHashSymbol(string memory hashtag) internal pure returns (string memory) {
-        bytes memory hashtagBytes = bytes(hashtag);
-        if (hashtagBytes.length > 0 && hashtagBytes[0] == bytes1("#")) {
-            bytes memory result = new bytes(hashtagBytes.length - 1);
-            for (uint256 i = 1; i < hashtagBytes.length; i++) {
-                result[i - 1] = hashtagBytes[i];
+        // Validate tier configuration if provided
+        if (params.tierNames.length > 0) {
+            require(params.tierNames.length <= 10, "Max 10 tiers");
+            require(params.tierDistribution.length == params.tierNames.length, "Tier arrays length mismatch");
+            require(params.tierThresholds.length == params.tierNames.length, "Threshold array length mismatch");
+            
+            // Validate distribution sums to 100
+            uint256 totalDistribution = 0;
+            for (uint256 i = 0; i < params.tierDistribution.length; i++) {
+                totalDistribution += params.tierDistribution[i];
             }
-            return string(result);
+            require(totalDistribution == 100, "Tier distribution must sum to 100%");
         }
-        return hashtag;
+        
+        // Validate specific chains if provided
+        if (params.specificChains.length > 0) {
+            require(params.specificChains.length <= 10, "Max 10 chains");
+            for (uint256 i = 0; i < params.specificChains.length; i++) {
+                require(supportedChains[params.specificChains[i]], "Unsupported chain");
+            }
+        }
     }
     
     /**
-     * @dev Validate hashtag format for Farcaster
-     * @param hashtag The hashtag string to validate
-     * @return isValid Whether the hashtag is valid
+     * @dev Validate hashtag format
      */
     function _isValidHashtag(string memory hashtag) internal pure returns (bool) {
         bytes memory hashtagBytes = bytes(hashtag);
         
-        // Must not be empty and must start with #
         if (hashtagBytes.length == 0 || hashtagBytes[0] != bytes1("#")) {
             return false;
         }
         
-        // Must have content after #
         if (hashtagBytes.length == 1) {
             return false;
         }
         
-        // Check for valid characters (alphanumeric + underscore)
+        // Check valid characters
         for (uint256 i = 1; i < hashtagBytes.length; i++) {
             bytes1 char = hashtagBytes[i];
             if (!(
@@ -548,70 +641,87 @@ contract HashDropCampaignFactory is Ownable, ReentrancyGuard {
         return true;
     }
     
+    // ===== VIEW FUNCTIONS =====
+    
     /**
-     * @dev Internal validation function
+     * @dev Get supported chains list
      */
-    function _validateCampaignParams(CampaignSetupParams memory params) internal pure {
-        require(bytes(params.hashtag).length > 0, "Hashtag cannot be empty");
-        require(params.duration > 0, "Duration must be positive");
-        require(params.totalBudget > 0, "Budget must be positive");
-        require(params.totalRewards > 0, "Total rewards must be positive");
-        require(params.supportedChainIds.length > 0, "Must support at least one chain");
+    function getSupportedChains() external view returns (uint256[] memory) {
+        return defaultSupportedChains;
+    }
+    
+    /**
+     * @dev Get user's campaigns
+     */
+    function getUserCampaigns(address user) external view returns (uint256[] memory) {
+        return creatorCampaigns[user];
+    }
+    
+    /**
+     * @dev Check if chain is supported
+     */
+    function isChainSupported(uint256 chainId) external view returns (bool) {
+        return supportedChains[chainId];
+    }
+    
+    // ===== ADMIN FUNCTIONS =====
+    
+    /**
+     * @dev Add supported chain (admin only)
+     */
+    function addSupportedChain(uint256 chainId) external onlyOwner {
+        require(!supportedChains[chainId], "Chain already supported");
+        supportedChains[chainId] = true;
+        defaultSupportedChains.push(chainId);
+    }
+    
+    /**
+     * @dev Remove supported chain (admin only)
+     */
+    function removeSupportedChain(uint256 chainId) external onlyOwner {
+        require(supportedChains[chainId], "Chain not supported");
+        supportedChains[chainId] = false;
         
-        require(params.tierNames.length > 0, "Must have at least one tier");
-        require(params.tierNames.length <= 10, "Maximum 10 tiers allowed");
-        require(
-            params.tierNames.length == params.baseURIs.length && 
-            params.baseURIs.length == params.maxSupplies.length && 
-            params.maxSupplies.length == params.scoreThresholds.length,
-            "Tier array lengths must match"
-        );
-        
-        // Validate individual tier parameters
-        for (uint256 i = 0; i < params.tierNames.length; i++) {
-            require(bytes(params.tierNames[i]).length > 0, "Tier name cannot be empty");
-            require(bytes(params.baseURIs[i]).length > 0, "Base URI cannot be empty");
-            require(params.maxSupplies[i] > 0, "Max supply must be positive");
-            require(params.scoreThresholds[i] <= 100, "Score threshold cannot exceed 100");
-        }
-        
-        // For multi-tier campaigns, validate score thresholds are ascending
-        if (params.tierNames.length > 1) {
-            for (uint256 i = 1; i < params.scoreThresholds.length; i++) {
-                require(
-                    params.scoreThresholds[i-1] < params.scoreThresholds[i], 
-                    "Score thresholds must be ascending"
-                );
+        // Remove from default array
+        for (uint256 i = 0; i < defaultSupportedChains.length; i++) {
+            if (defaultSupportedChains[i] == chainId) {
+                defaultSupportedChains[i] = defaultSupportedChains[defaultSupportedChains.length - 1];
+                defaultSupportedChains.pop();
+                break;
             }
         }
-        
-        // Validate monitoring parameters
-        if (params.enableMonitoring) {
-            require(
-                params.monitoringInterval == 0 || params.monitoringInterval >= MIN_MONITORING_INTERVAL, 
-                "Monitoring interval must be at least 5 minutes"
-            );
-        }
     }
     
     /**
-     * @dev Emergency pause function
+     * @dev Update contract addresses (admin only)
+     */
+    function updateContractAddresses(
+        address _campaignContract,
+        address _nftContract,
+        address _vaultContract,
+        address _oracleContract,
+        address _ccipManager,
+        address _feeToken
+    ) external onlyOwner {
+        contractAddresses.campaignContract = _campaignContract;
+        contractAddresses.nftContract = _nftContract;
+        contractAddresses.vaultContract = _vaultContract;
+        contractAddresses.oracleContract = _oracleContract;
+        contractAddresses.ccipManager = _ccipManager;
+        contractAddresses.feeToken = _feeToken;
+    }
+    
+    /**
+     * @dev Withdraw collected fees (admin only)
+     */
+    function withdrawFees() external onlyOwner {
+        payable(owner()).transfer(address(this).balance);
+    }
+    
+    /**
+     * @dev Emergency pause (admin only)
      */
     function emergencyPause() external onlyOwner {
-        // In a real implementation, you might want to pause all active campaigns
-        // This would require additional state management
-    }
-    
-    /**
-     * @dev Check if factory is properly configured
-     * @return isConfigured Whether all contract addresses are set
-     */
-    function isFactoryConfigured() external view returns (bool isConfigured) {
-        return (
-            contractAddresses.campaignContract != address(0) &&
-            contractAddresses.nftContract != address(0) &&
-            contractAddresses.vaultContract != address(0) &&
-            contractAddresses.oracleContract != address(0)
-        );
+        // Implementation for emergency scenarios
     }
 }
