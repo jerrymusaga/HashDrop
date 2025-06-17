@@ -1,14 +1,19 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
+import {AutomationCompatibleInterface} from "chainlink-brownie-contracts/contracts/src/v0.8/automation/AutomationCompatible.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "./Campaign.sol";
 import "./Rewards.sol";
 
-contract HashDropVault is Ownable, ReentrancyGuard {
+contract HashDropVault is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
     HashDropCampaign public campaignContract;
     HashDropRewards public rewardsContract;
+
+    // Automation config
+    uint256 public constant CHECK_INTERVAL = 1 hours;
+    uint256 public lastUpkeepTime;
     
     struct BatchRequest {
         uint256 campaignId;
@@ -177,5 +182,50 @@ contract HashDropVault is Ownable, ReentrancyGuard {
     function updateContracts(address _campaignContract, address _rewardsContract) external onlyOwner {
         campaignContract = HashDropCampaign(_campaignContract);
         rewardsContract = HashDropRewards(_rewardsContract);
+    }
+
+    /**
+     * @dev Chainlink Automation - Check if upkeep is needed
+     */
+    function checkUpkeep(bytes calldata) external view override returns (bool upkeepNeeded, bytes memory performData) {
+        // Check if there are batches ready for processing
+        uint256[] memory pendingBatches = new uint256[](batchCounter);
+        uint256 count = 0;
+        
+        for (uint256 i = 1; i <= batchCounter; i++) {
+            BatchRequest storage batch = batchRequests[i];
+            if (!batch.processed && (
+                batch.users.length >= BATCH_SIZE_THRESHOLD ||
+                block.timestamp >= batch.timestamp + BATCH_TIME_THRESHOLD
+            )) {
+                pendingBatches[count] = i;
+                count++;
+            }
+        }
+        
+        upkeepNeeded = count > 0 && (block.timestamp - lastUpkeepTime) >= CHECK_INTERVAL;
+        
+        // Return batch IDs to process
+        uint256[] memory batchesToProcess = new uint256[](count);
+        for (uint256 i = 0; i < count; i++) {
+            batchesToProcess[i] = pendingBatches[i];
+        }
+        
+        performData = abi.encode(batchesToProcess);
+    }
+    
+    /**
+     * @dev Chainlink Automation - Perform upkeep
+     */
+    function performUpkeep(bytes calldata performData) external override {
+        uint256[] memory batchIds = abi.decode(performData, (uint256[]));
+        
+        for (uint256 i = 0; i < batchIds.length; i++) {
+            if (batchIds[i] > 0 && batchIds[i] <= batchCounter) {
+                try this.processBatch(batchIds[i]) {} catch {}
+            }
+        }
+        
+        lastUpkeepTime = block.timestamp;
     }
 }
