@@ -3,306 +3,490 @@ pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
-import {HashDropNFT} from "./NFT.sol";
-import {HashDropCampaign} from "./Campaign.sol";
-import {HashDropCCIPManager} from "./CCIPManager.sol";
+import "@chainlink/contracts/src/v0.8/automation/AutomationCompatible.sol";
 
-contract HashDropVault is Ownable, ReentrancyGuard {
-
-    HashDropCCIPManager public ccipManager;
+/**
+ * @title HashDropVault  
+ * @dev Batch processing and reward distribution with Chainlink Automation
+ */
+contract HashDropVault is Ownable, ReentrancyGuard, AutomationCompatibleInterface {
     
-    struct VaultConfig {
-        address campaignContract;
-        address rewardContract;
-        bool active;
-        uint256 totalRewards;
-        uint256 claimedRewards;
-        mapping(address => bool) hasClaimed;
-        mapping(address => uint256) userTokenIds; // Track minted token IDs for users
+    // Contract references
+    address public campaignContract;
+    address public rewardsContract; // Now points to HashDropRewardsManager
+    
+    struct BatchRequest {
+        uint256 campaignId;
+        address[] users;
+        uint256[] scores;
+        bool processed;
+        uint256 timestamp;
+        uint256 successCount; // Number of successful rewards
+        bool vrfSelectionNeeded; // Whether VRF selection is needed
+        uint256 vrfRequestId; // VRF request ID if applicable
     }
     
-    mapping(uint256 => VaultConfig) public vaultConfigs;
-    mapping(address => bool) public authorizedClaimers;
+    struct VaultStats {
+        uint256 totalBatches;
+        uint256 totalRewardsDistributed;
+        uint256 totalParticipants;
+        uint256 averageBatchSize;
+        uint256 lastProcessingTime;
+    }
     
-    event VaultConfigured(uint256 indexed campaignId, address campaignContract, address rewardContract, uint256 totalRewards);
-    event RewardClaimed(uint256 indexed campaignId, address indexed user, uint256 tierId, uint256 tokenId, string tierName);
-    event ClaimerAuthorized(address indexed claimer, bool authorized);
-    event VaultStatusChanged(uint256 indexed campaignId, bool active);
+    // Storage
+    mapping(uint256 => BatchRequest) public batchRequests;
+    uint256 public batchCounter;
+    VaultStats public vaultStats;
     
-    modifier onlyAuthorizedClaimer() {
-    require(
-        authorizedClaimers[msg.sender] || 
-        msg.sender == owner() ||
-        (address(ccipManager) != address(0) && msg.sender == address(ccipManager)),
-        "Not authorized to process claims"
+    // Batch processing configuration
+    uint256 public constant BATCH_SIZE_THRESHOLD = 10; // Process when 10+ users
+    uint256 public constant BATCH_TIME_THRESHOLD = 1 hours; // Or after 1 hour
+    uint256 public constant MAX_BATCH_SIZE = 100; // Maximum users per batch
+    uint256 public constant CHECK_INTERVAL = 300; // 5 minutes between automation checks
+    
+    uint256 public lastUpkeepTime;
+    address public vrfContract; // VRF contract for fair selection
+    
+    // Events
+    event BatchRequestCreated(
+        uint256 indexed batchId, 
+        uint256 indexed campaignId, 
+        uint256 userCount,
+        bool vrfNeeded
     );
-    _;
-}
-
-    modifier validVault(uint256 campaignId) {
-        require(vaultConfigs[campaignId].rewardContract != address(0), "Vault not configured");
+    event BatchProcessed(
+        uint256 indexed batchId, 
+        uint256 successCount, 
+        uint256 totalUsers,
+        uint256 processingTime
+    );
+    event IndividualRewardProcessed(
+        uint256 indexed campaignId, 
+        address indexed user, 
+        uint256 score,
+        bool success
+    );
+    event VRFSelectionRequested(
+        uint256 indexed batchId, 
+        uint256 qualified, 
+        uint256 available
+    );
+    event ContractsUpdated(address campaignContract, address rewardsContract);
+    event VRFContractUpdated(address vrfContract);
+    
+    modifier validContracts() {
+        require(campaignContract != address(0), "Campaign contract not set");
+        require(rewardsContract != address(0), "Rewards contract not set");
         _;
     }
     
-    constructor() Ownable(msg.sender) {}
-
-    function setCCIPManager(address _ccipManager) external onlyOwner {
-        ccipManager = HashDropCCIPManager(payable(_ccipManager));
-    }
-
     /**
-     * @dev Configure vault for a campaign
-     * @param campaignId The campaign ID
-     * @param campaignContract Address of the campaign contract
-     * @param rewardContract Address of the NFT reward contract
-     * @param totalRewards Maximum number of rewards that can be claimed
+     * @dev Constructor sets initial contract references
+     * @param _campaignContract Address of HashDropCampaign contract
+     * @param _rewardsContract Address of HashDropRewardsManager contract
      */
-    function configureVault(
-        uint256 campaignId,
-        address campaignContract,
-        address rewardContract,
-        uint256 totalRewards
-    ) external onlyOwner {
-        require(campaignContract != address(0), "Invalid campaign contract");
-        require(rewardContract != address(0), "Invalid reward contract");
-        require(totalRewards > 0, "Total rewards must be positive");
+    constructor(address _campaignContract, address _rewardsContract) Ownable(msg.sender) {
+        require(_campaignContract != address(0), "Invalid campaign contract");
+        require(_rewardsContract != address(0), "Invalid rewards contract");
         
-        VaultConfig storage config = vaultConfigs[campaignId];
-        config.campaignContract = campaignContract;
-        config.rewardContract = rewardContract;
-        config.active = true;
-        config.totalRewards = totalRewards;
-        config.claimedRewards = 0;
-        
-        emit VaultConfigured(campaignId, campaignContract, rewardContract, totalRewards);
+        campaignContract = _campaignContract;
+        rewardsContract = _rewardsContract;
+        lastUpkeepTime = block.timestamp;
     }
     
     /**
-     * @dev Set claimer authorization
+     * @dev Create batch reward request with automatic processing logic
      */
-    function setClaimerAuthorization(address claimer, bool authorized) external onlyOwner {
-        require(claimer != address(0), "Invalid claimer address");
-        authorizedClaimers[claimer] = authorized;
-        emit ClaimerAuthorized(claimer, authorized);
-    }
-
-    /**
-     * @dev Process reward claim for a user based on their score
-     * @param campaignId The campaign ID
-     * @param user Address of the user claiming the reward
-     * @param score User's engagement score (0-100)
-     */
-    function processRewardClaim(
-        uint256 campaignId,
-        address user,
-        uint256 score
-    ) external onlyAuthorizedClaimer nonReentrant validVault(campaignId) {
-        VaultConfig storage config = vaultConfigs[campaignId];
-        require(config.active, "Vault not active");
-        require(!config.hasClaimed[user], "User already claimed reward");
-        require(config.claimedRewards < config.totalRewards, "No rewards remaining");
-        require(score > 0 && score <= 100, "Invalid score range");
-        
-        // Verify user participated in campaign
-        HashDropCampaign campaignContract = HashDropCampaign(config.campaignContract);
-        require(campaignContract.hasUserParticipated(campaignId, user), "User has not participated");
-        
-        // Get stored score matches provided score
-        uint256 storedScore = campaignContract.getUserScore(campaignId, user);
-        require(storedScore == score, "Score mismatch");
-        
-        HashDropNFT nftContract = HashDropNFT(config.rewardContract);
-        
-        // Determine which tier the user qualifies for based on their score
-        uint256 qualifiedTierId = nftContract.determineTierForScore(campaignId, score);
-        
-        // Check if the tier is available for minting
-        require(nftContract.tierAvailable(campaignId, qualifiedTierId), "Qualified tier not available");
-        
-        // Mark as claimed before minting to prevent reentrancy
-        config.hasClaimed[user] = true;
-        config.claimedRewards++;
-        
-        // Mint the NFT
-        uint256 tokenId = nftContract.mint(user, campaignId, qualifiedTierId);
-        config.userTokenIds[user] = tokenId;
-        
-        // Get tier name for event
-        (string memory tierName,,,,,) = nftContract.getTierInfo(campaignId, qualifiedTierId);
-        
-        // Consume budget from campaign contract
-        try campaignContract.consumeBudget(campaignId, 1) {} catch {
-            // Continue even if budget tracking fails
-        }
-        
-        emit RewardClaimed(campaignId, user, qualifiedTierId, tokenId, tierName);
-    }
-    
-    /**
-     * @dev Batch process multiple reward claims
-     */
-    function batchProcessRewardClaims(
+    function createBatchRewardRequest(
         uint256 campaignId,
         address[] memory users,
         uint256[] memory scores
-    ) external onlyAuthorizedClaimer nonReentrant validVault(campaignId) {
-        require(users.length == scores.length, "Arrays length mismatch");
-        require(users.length > 0, "No users provided");
+    ) external onlyOwner validContracts returns (uint256) {
+        require(users.length == scores.length, "Array length mismatch");
+        require(users.length > 0, "Empty batch not allowed");
+        require(users.length <= MAX_BATCH_SIZE, "Batch size too large");
         
-        VaultConfig storage config = vaultConfigs[campaignId];
-        require(config.active, "Vault not active");
-        require(config.claimedRewards + users.length <= config.totalRewards, "Not enough rewards remaining");
+        uint256 batchId = ++batchCounter;
         
-        HashDropCampaign campaignContract = HashDropCampaign(config.campaignContract);
-        HashDropNFT nftContract = HashDropNFT(config.rewardContract);
+        // Check if VRF selection might be needed (this would be implemented with VRF contract)
+        bool vrfNeeded = _checkIfVRFNeeded(campaignId, users.length);
         
-        for (uint256 i = 0; i < users.length; i++) {
-            address user = users[i];
-            uint256 score = scores[i];
-            
-            // Skip if user already claimed
-            if (config.hasClaimed[user]) continue;
-            
-            // Verify participation and score
-            if (!campaignContract.hasUserParticipated(campaignId, user)) continue;
-            if (campaignContract.getUserScore(campaignId, user) != score) continue;
-            
-            try nftContract.determineTierForScore(campaignId, score) returns (uint256 qualifiedTierId) {
-                if (nftContract.tierAvailable(campaignId, qualifiedTierId)) {
-                    config.hasClaimed[user] = true;
-                    config.claimedRewards++;
-                    
-                    uint256 tokenId = nftContract.mint(user, campaignId, qualifiedTierId);
-                    config.userTokenIds[user] = tokenId;
-                    
-                    (string memory tierName,,,,,) = nftContract.getTierInfo(campaignId, qualifiedTierId);
-                    emit RewardClaimed(campaignId, user, qualifiedTierId, tokenId, tierName);
-                }
-            } catch {
-                // Skip users who don't qualify for any tier
-                continue;
+        batchRequests[batchId] = BatchRequest({
+            campaignId: campaignId,
+            users: users,
+            scores: scores,
+            processed: false,
+            timestamp: block.timestamp,
+            successCount: 0,
+            vrfSelectionNeeded: vrfNeeded,
+            vrfRequestId: 0
+        });
+        
+        // Update stats
+        vaultStats.totalBatches++;
+        vaultStats.totalParticipants += users.length;
+        _updateAverageBatchSize();
+        
+        emit BatchRequestCreated(batchId, campaignId, users.length, vrfNeeded);
+        
+        // Auto-process if threshold met and no VRF needed
+        if (users.length >= BATCH_SIZE_THRESHOLD && !vrfNeeded) {
+            _processBatch(batchId);
+        }
+        
+        return batchId;
+    }
+    
+    /**
+     * @dev Process a specific batch (manual trigger or automation)
+     */
+    function processBatch(uint256 batchId) external {
+        require(batchId > 0 && batchId <= batchCounter, "Invalid batch ID");
+        
+        BatchRequest storage batch = batchRequests[batchId];
+        require(!batch.processed, "Batch already processed");
+        
+        // Check if batch is ready for processing
+        bool sizeReady = batch.users.length >= BATCH_SIZE_THRESHOLD;
+        bool timeReady = block.timestamp >= batch.timestamp + BATCH_TIME_THRESHOLD;
+        
+        require(sizeReady || timeReady, "Batch not ready for processing");
+        require(!batch.vrfSelectionNeeded, "VRF selection pending");
+        
+        _processBatch(batchId);
+    }
+    
+    /**
+     * @dev Internal batch processing logic
+     */
+    function _processBatch(uint256 batchId) internal nonReentrant {
+        BatchRequest storage batch = batchRequests[batchId];
+        require(!batch.processed, "Batch already processed");
+        
+        uint256 startTime = block.timestamp;
+        batch.processed = true;
+        
+        // Call rewards manager to batch mint
+        (bool success, bytes memory returnData) = rewardsContract.call(
+            abi.encodeWithSignature(
+                "batchMintRewards(address[],uint256,uint256[])",
+                batch.users,
+                batch.campaignId,
+                batch.scores
+            )
+        );
+        
+        uint256 successCount = 0;
+        if (success && returnData.length > 0) {
+            successCount = abi.decode(returnData, (uint256));
+        }
+        
+        batch.successCount = successCount;
+        
+        // Mark users as rewarded in campaign contract
+        for (uint256 i = 0; i < batch.users.length; i++) {
+            try this._markUserRewarded(batch.campaignId, batch.users[i]) {} catch {
+                // Continue if marking fails
             }
         }
         
-        // Update campaign budget
-        try campaignContract.consumeBudget(campaignId, config.claimedRewards) {} catch {}
+        // Update stats
+        vaultStats.totalRewardsDistributed += successCount;
+        vaultStats.lastProcessingTime = block.timestamp;
+        
+        uint256 processingTime = block.timestamp - startTime;
+        
+        emit BatchProcessed(batchId, successCount, batch.users.length, processingTime);
     }
     
     /**
-     * @dev Check if user has claimed reward
+     * @dev Process individual reward (for urgent cases or small batches)
      */
-    function hasUserClaimed(uint256 campaignId, address user) external view validVault(campaignId) returns (bool) {
-        return vaultConfigs[campaignId].hasClaimed[user];
+    function processIndividualReward(
+        uint256 campaignId,
+        address user,
+        uint256 score
+    ) external onlyOwner validContracts nonReentrant {
+        require(user != address(0), "Invalid user address");
+        require(score <= 100, "Invalid score");
+        
+        // Call rewards manager to mint reward
+        (bool success,) = rewardsContract.call(
+            abi.encodeWithSignature(
+                "mintReward(address,uint256,uint256)",
+                user,
+                campaignId,
+                score
+            )
+        );
+        
+        if (success) {
+            // Mark user as rewarded
+            try this._markUserRewarded(campaignId, user) {} catch {}
+            
+            vaultStats.totalRewardsDistributed++;
+        }
+        
+        emit IndividualRewardProcessed(campaignId, user, score, success);
     }
     
     /**
-     * @dev Get user's minted token ID
+     * @dev External function to mark user as rewarded (for try-catch)
      */
-    function getUserTokenId(uint256 campaignId, address user) external view validVault(campaignId) returns (uint256) {
-        require(vaultConfigs[campaignId].hasClaimed[user], "User has not claimed");
-        return vaultConfigs[campaignId].userTokenIds[user];
+    function _markUserRewarded(uint256 campaignId, address user) external {
+        require(msg.sender == address(this), "Internal function only");
+        
+        (bool success,) = campaignContract.call(
+            abi.encodeWithSignature(
+                "markAsRewarded(uint256,address)",
+                campaignId,
+                user
+            )
+        );
+        
+        require(success, "Failed to mark user as rewarded");
+    }
+    
+    /**
+     * @dev Chainlink Automation - Check if upkeep is needed
+     */
+    function checkUpkeep(bytes calldata checkData) 
+        external 
+        view 
+        override 
+        returns (bool upkeepNeeded, bytes memory performData) 
+    {
+        // Silence unused parameter warning
+        checkData;
+        
+        // Check if enough time has passed since last upkeep
+        if (block.timestamp < lastUpkeepTime + CHECK_INTERVAL) {
+            return (false, "");
+        }
+        
+        // Find batches ready for processing
+        uint256[] memory readyBatches = new uint256[](batchCounter);
+        uint256 count = 0;
+        
+        for (uint256 i = 1; i <= batchCounter; i++) {
+            BatchRequest storage batch = batchRequests[i];
+            
+            if (!batch.processed && !batch.vrfSelectionNeeded) {
+                bool sizeReady = batch.users.length >= BATCH_SIZE_THRESHOLD;
+                bool timeReady = block.timestamp >= batch.timestamp + BATCH_TIME_THRESHOLD;
+                
+                if (sizeReady || timeReady) {
+                    readyBatches[count] = i;
+                    count++;
+                }
+            }
+        }
+        
+        upkeepNeeded = count > 0;
+        
+        if (upkeepNeeded) {
+            // Resize array to actual count
+            uint256[] memory batchesToProcess = new uint256[](count);
+            for (uint256 i = 0; i < count; i++) {
+                batchesToProcess[i] = readyBatches[i];
+            }
+            performData = abi.encode(batchesToProcess);
+        }
+    }
+    
+    /**
+     * @dev Chainlink Automation - Perform upkeep
+     */
+    function performUpkeep(bytes calldata performData) external override {
+        uint256[] memory batchIds = abi.decode(performData, (uint256[]));
+        
+        for (uint256 i = 0; i < batchIds.length; i++) {
+            uint256 batchId = batchIds[i];
+            
+            if (batchId > 0 && batchId <= batchCounter) {
+                BatchRequest storage batch = batchRequests[batchId];
+                
+                // Double-check batch is ready and not processed
+                if (!batch.processed && !batch.vrfSelectionNeeded) {
+                    bool sizeReady = batch.users.length >= BATCH_SIZE_THRESHOLD;
+                    bool timeReady = block.timestamp >= batch.timestamp + BATCH_TIME_THRESHOLD;
+                    
+                    if (sizeReady || timeReady) {
+                        try this._processBatch(batchId) {} catch {
+                            // Continue with next batch if one fails
+                        }
+                    }
+                }
+            }
+        }
+        
+        lastUpkeepTime = block.timestamp;
+    }
+    
+    /**
+     * @dev External wrapper for _processBatch (for try-catch in performUpkeep)
+     */
+    function _processBatch(uint256 batchId) external {
+        require(msg.sender == address(this), "Internal function only");
+        _processBatch(batchId);
+    }
+    
+    /**
+     * @dev Get pending batches that can be processed
+     */
+    function getPendingBatches() external view returns (uint256[] memory) {
+        uint256[] memory pending = new uint256[](batchCounter);
+        uint256 count = 0;
+        
+        for (uint256 i = 1; i <= batchCounter; i++) {
+            BatchRequest storage batch = batchRequests[i];
+            
+            if (!batch.processed && !batch.vrfSelectionNeeded) {
+                bool sizeReady = batch.users.length >= BATCH_SIZE_THRESHOLD;
+                bool timeReady = block.timestamp >= batch.timestamp + BATCH_TIME_THRESHOLD;
+                
+                if (sizeReady || timeReady) {
+                    pending[count] = i;
+                    count++;
+                }
+            }
+        }
+        
+        // Resize array to actual count
+        uint256[] memory result = new uint256[](count);
+        for (uint256 i = 0; i < count; i++) {
+            result[i] = pending[i];
+        }
+        
+        return result;
+    }
+    
+    /**
+     * @dev Get batch information
+     */
+    function getBatchInfo(uint256 batchId) external view returns (
+        uint256 campaignId,
+        uint256 userCount,
+        bool processed,
+        uint256 timestamp,
+        uint256 successCount,
+        bool readyForProcessing,
+        bool vrfSelectionNeeded
+    ) {
+        require(batchId > 0 && batchId <= batchCounter, "Invalid batch ID");
+        
+        BatchRequest storage batch = batchRequests[batchId];
+        
+        bool sizeReady = batch.users.length >= BATCH_SIZE_THRESHOLD;
+        bool timeReady = block.timestamp >= batch.timestamp + BATCH_TIME_THRESHOLD;
+        bool ready = !batch.processed && !batch.vrfSelectionNeeded && (sizeReady || timeReady);
+        
+        return (
+            batch.campaignId,
+            batch.users.length,
+            batch.processed,
+            batch.timestamp,
+            batch.successCount,
+            ready,
+            batch.vrfSelectionNeeded
+        );
     }
     
     /**
      * @dev Get vault statistics
      */
-    function getVaultStats(uint256 campaignId) external view validVault(campaignId) returns (
-        address campaignContract,
-        address rewardContract,
-        bool active,
-        uint256 totalRewards,
-        uint256 claimedRewards,
-        uint256 remainingRewards
+    function getVaultStats() external view returns (
+        uint256 totalBatches,
+        uint256 totalRewardsDistributed,
+        uint256 totalParticipants,
+        uint256 averageBatchSize,
+        uint256 lastProcessingTime,
+        uint256 pendingBatches
     ) {
-        VaultConfig storage config = vaultConfigs[campaignId];
+        // Count pending batches
+        uint256 pending = 0;
+        for (uint256 i = 1; i <= batchCounter; i++) {
+            if (!batchRequests[i].processed) {
+                pending++;
+            }
+        }
+        
         return (
-            config.campaignContract,
-            config.rewardContract,
-            config.active,
-            config.totalRewards,
-            config.claimedRewards,
-            config.totalRewards - config.claimedRewards
+            vaultStats.totalBatches,
+            vaultStats.totalRewardsDistributed,
+            vaultStats.totalParticipants,
+            vaultStats.averageBatchSize,
+            vaultStats.lastProcessingTime,
+            pending
         );
     }
-
+    
     /**
-    * @dev Initiate cross-chain reward claim
-    */
-    function initiateXChainClaim(
-        uint256 destinationChainId,
-        uint256 campaignId,
-        address user
-    ) external onlyAuthorizedClaimer validVault(campaignId) {
-        require(address(ccipManager) != address(0), "CCIP Manager not set");
+     * @dev Update contract addresses (owner only)
+     */
+    function updateContracts(address _campaignContract, address _rewardsContract) external onlyOwner {
+        require(_campaignContract != address(0), "Invalid campaign contract");
+        require(_rewardsContract != address(0), "Invalid rewards contract");
         
-        VaultConfig storage config = vaultConfigs[campaignId];
-        require(config.active, "Vault not active");
-        require(!config.hasClaimed[user], "User already claimed reward");
+        campaignContract = _campaignContract;
+        rewardsContract = _rewardsContract;
         
-        // Get user's score from campaign contract
-        HashDropCampaign campaignContract = HashDropCampaign(config.campaignContract);
-        require(campaignContract.hasUserParticipated(campaignId, user), "User has not participated");
-        
-        uint256 score = campaignContract.getUserScore(campaignId, user);
-        
-        // Send cross-chain claim request
-        ccipManager.sendRewardClaim(destinationChainId, campaignId, user, score);
+        emit ContractsUpdated(_campaignContract, _rewardsContract);
     }
     
     /**
-     * @dev Preview what tier a user would qualify for
+     * @dev Set VRF contract address (for future VRF integration)
      */
-    function previewUserTier(uint256 campaignId, address user) external view validVault(campaignId) returns (
-        uint256 tierId,
-        string memory tierName,
-        bool available
+    function setVRFContract(address _vrfContract) external onlyOwner {
+        vrfContract = _vrfContract;
+        emit VRFContractUpdated(_vrfContract);
+    }
+    
+    /**
+     * @dev Check if VRF selection is needed (placeholder for VRF integration)
+     */
+    function _checkIfVRFNeeded(uint256 campaignId, uint256 participantCount) internal view returns (bool) {
+        // Placeholder logic - in full implementation, this would check:
+        // 1. Campaign reward supply vs participant count
+        // 2. Whether VRF contract is set and campaign configured for fair selection
+        // 3. If limited rewards require random selection
+        
+        campaignId; // Silence unused parameter warning
+        participantCount; // Silence unused parameter warning
+        
+        return false; // For now, no VRF selection needed
+    }
+    
+    /**
+     * @dev Update average batch size calculation
+     */
+    function _updateAverageBatchSize() internal {
+        if (vaultStats.totalBatches > 0) {
+            vaultStats.averageBatchSize = vaultStats.totalParticipants / vaultStats.totalBatches;
+        }
+    }
+    
+    /**
+     * @dev Emergency function to process stuck batch (owner only)
+     */
+    function emergencyProcessBatch(uint256 batchId) external onlyOwner {
+        require(batchId > 0 && batchId <= batchCounter, "Invalid batch ID");
+        require(!batchRequests[batchId].processed, "Batch already processed");
+        
+        _processBatch(batchId);
+    }
+    
+    /**
+     * @dev Get batch users and scores (for debugging)
+     */
+    function getBatchData(uint256 batchId) external view onlyOwner returns (
+        address[] memory users,
+        uint256[] memory scores
     ) {
-        VaultConfig storage config = vaultConfigs[campaignId];
-        HashDropCampaign campaignContract = HashDropCampaign(config.campaignContract);
+        require(batchId > 0 && batchId <= batchCounter, "Invalid batch ID");
         
-        require(campaignContract.hasUserParticipated(campaignId, user), "User has not participated");
-        
-        uint256 score = campaignContract.getUserScore(campaignId, user);
-        HashDropNFT nftContract = HashDropNFT(config.rewardContract);
-        
-        uint256 qualifiedTierId = nftContract.determineTierForScore(campaignId, score);
-        (string memory name,,,,,) = nftContract.getTierInfo(campaignId, qualifiedTierId);
-        bool isAvailable = nftContract.tierAvailable(campaignId, qualifiedTierId);
-        
-        return (qualifiedTierId, name, isAvailable);
-    }
-    
-    /**
-     * @dev Pause vault operations
-     */
-    function pauseVault(uint256 campaignId) external onlyOwner validVault(campaignId) {
-        vaultConfigs[campaignId].active = false;
-        emit VaultStatusChanged(campaignId, false);
-    }
-    
-    /**
-     * @dev Resume vault operations
-     */
-    function resumeVault(uint256 campaignId) external onlyOwner validVault(campaignId) {
-        vaultConfigs[campaignId].active = true;
-        emit VaultStatusChanged(campaignId, true);
-    }
-    
-    /**
-     * @dev Update vault reward limits
-     */
-    function updateVaultLimits(uint256 campaignId, uint256 newTotalRewards) external onlyOwner validVault(campaignId) {
-        VaultConfig storage config = vaultConfigs[campaignId];
-        require(newTotalRewards >= config.claimedRewards, "Cannot reduce below claimed amount");
-        
-        config.totalRewards = newTotalRewards;
-    }
-    
-    /**
-     * @dev Emergency function to update reward contract
-     */
-    function updateRewardContract(uint256 campaignId, address newRewardContract) external onlyOwner validVault(campaignId) {
-        require(newRewardContract != address(0), "Invalid reward contract");
-        vaultConfigs[campaignId].rewardContract = newRewardContract;
+        BatchRequest storage batch = batchRequests[batchId];
+        return (batch.users, batch.scores);
     }
 }

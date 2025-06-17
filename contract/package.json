@@ -1,0 +1,41 @@
+{
+  "name": "hashdrop-contracts",
+  "version": "1.0.0",
+  "description": "HashDrop Smart Contracts - AI-Powered Cross-Chain Farcaster Rewards",
+  "scripts": {
+    "install": "forge install",
+    "build": "forge build",
+    "test": "forge test",
+    "test:coverage": "forge coverage",
+    "test:gas": "forge test --gas-report",
+    "clean": "forge clean",
+    "format": "forge fmt",
+    "lint": "forge fmt --check",
+    "deploy:fuji": "make deploy-fuji",
+    "deploy:avalanche": "make deploy-avax",
+    "verify": "make verify",
+    "docs": "forge doc"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/yourusername/hashdrop.git"
+  },
+  "keywords": [
+    "solidity",
+    "smart-contracts",
+    "avalanche",
+    "chainlink",
+    "farcaster",
+    "social-rewards",
+    "nft",
+    "defi"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "devDependencies": {
+    "solhint": "^3.4.1"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  }
+}

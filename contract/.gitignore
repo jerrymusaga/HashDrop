@@ -1,6 +1,7 @@
 # Compiler files
 cache/
 out/
+artifacts/
 
 # Ignores development broadcast logs
 !/broadcast
@@ -10,5 +11,38 @@ out/
 # Docs
 docs/
 
-# Dotenv file
+# Environment files
 .env
+.env.local
+.env.production
+
+# Node modules (if using npm scripts)
+node_modules/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/
+
+# Coverage reports
+coverage/
+lcov.info
+
+# Gas reports
+gas-report.txt
+
+# Foundry cache
+cache_forge/

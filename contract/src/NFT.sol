@@ -3,333 +3,204 @@ pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import "@openzeppelin/contracts/token/ERC721/extensions/ERC721URIStorage.sol";
-import "@openzeppelin/contracts/token/ERC721/extensions/ERC721Burnable.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/Strings.sol";
 
 /**
- * @title HashDropNFT - Unified NFT System
- * @dev Single system that handles both single-tier and multi-tier campaigns
+ * @title HashDropNFT
+ * @dev NFT rewards contract for HashDrop campaigns
  */
-contract HashDropNFT is ERC721, ERC721URIStorage, ERC721Burnable, Ownable {
-    uint256 private _nextTokenId;
+contract HashDropNFT is ERC721, ERC721URIStorage, Ownable {
+    using Strings for uint256;
     
-    struct TierConfig {
-        uint256 tierId;
-        string name;
-        string baseURI;
+    uint256 private _tokenIdCounter = 1;
+    
+    struct RewardTier {
+        uint256 minScore;
         uint256 maxSupply;
         uint256 currentSupply;
+        string name;
+        string imageURI;
         bool active;
     }
-
-    struct CampaignConfig {
-        uint256 tierCount;
-        mapping(uint256 => TierConfig) tiers;
-        mapping(uint256 => uint256) scoreThresholds; // tierId => minScore
-        bool active;
+    
+    struct CampaignRewards {
+        RewardTier[] tiers;
+        mapping(address => bool) hasClaimed;
+        mapping(address => uint256) claimedTier;
+        bool configured;
     }
-
-    // Campaign ID => Campaign's configuration
-    mapping(uint256 => CampaignConfig) public campaigns;
-    mapping(uint256 => uint256) public tokenCampaign; // tokenId => campaignId
-    mapping(uint256 => uint256) public tokenTier; // tokenId => tierId
+    
+    mapping(uint256 => CampaignRewards) public campaignRewards;
     mapping(address => bool) public authorizedMinters;
+    mapping(uint256 => uint256) public tokenToCampaign;
+    mapping(uint256 => uint256) public tokenToTier;
     
     event CampaignConfigured(uint256 indexed campaignId, uint256 tierCount);
-    event TierConfigured(uint256 indexed campaignId, uint256 tierId, string name, uint256 maxSupply, uint256 scoreThreshold);
-    event NFTMinted(address indexed to, uint256 tokenId, uint256 campaignId, uint256 tierId, string tierName);
-    event MinterAuthorized(address indexed minter, bool authorized);
-    event CampaignStatusChanged(uint256 indexed campaignId, bool active);
+    event NFTRewardMinted(address indexed to, uint256 campaignId, uint256 tierId, uint256 tokenId, string tierName);
     
     modifier onlyAuthorizedMinter() {
         require(authorizedMinters[msg.sender] || msg.sender == owner(), "Not authorized to mint");
         _;
     }
     
-    constructor(string memory name, string memory symbol) ERC721(name, symbol) Ownable(msg.sender) {}
-
-    /**
-     * @dev Configure a campaign with custom tiers
-     * @param campaignId The campaign ID
-     * @param tierNames Array of tier names
-     * @param baseURIs Array of base URIs for each tier
-     * @param maxSupplies Array of max supplies for each tier
-     * @param scoreThresholds Array of minimum scores for each tier
-     * 
-     * Examples:
-     * Single Tier: ["Standard"], ["ipfs://standard/"], [1000], [0]
-     * Multi Tier: ["Bronze", "Silver", "Gold"], ["ipfs://bronze/", "ipfs://silver/", "ipfs://gold/"], [500, 300, 100], [10, 50, 80]
-     */
-    function configureCampaign(
+    constructor() ERC721("HashDrop NFT", "HDROP") Ownable(msg.sender) {}
+    
+    function configureCampaignRewards(
         uint256 campaignId,
-        string[] memory tierNames,
-        string[] memory baseURIs,
+        uint256[] memory minScores,
         uint256[] memory maxSupplies,
-        uint256[] memory scoreThresholds
+        string[] memory names,
+        string[] memory imageURIs
     ) external onlyOwner {
-        require(tierNames.length > 0, "Must have at least one tier");
-        require(tierNames.length <= 10, "Maximum 10 tiers allowed");
+        require(campaignId > 0, "Invalid campaign ID");
+        require(minScores.length > 0, "Must have at least one tier");
         require(
-            tierNames.length == baseURIs.length && 
-            baseURIs.length == maxSupplies.length && 
-            maxSupplies.length == scoreThresholds.length,
-            "Array lengths must match"
+            minScores.length == maxSupplies.length &&
+            maxSupplies.length == names.length &&
+            names.length == imageURIs.length,
+            "Array length mismatch"
         );
         
-        // For multi-tier campaigns, validate score thresholds are in ascending order
-        if (tierNames.length > 1) {
-            for (uint256 i = 1; i < scoreThresholds.length; i++) {
-                require(scoreThresholds[i-1] < scoreThresholds[i], "Score thresholds must be ascending");
-            }
+        CampaignRewards storage rewards = campaignRewards[campaignId];
+        
+        if (rewards.configured) {
+            delete rewards.tiers;
         }
         
-        // Validate all score thresholds are within valid range
-        for (uint256 i = 0; i < scoreThresholds.length; i++) {
-            require(scoreThresholds[i] <= 100, "Score threshold cannot exceed 100");
-        }
+        rewards.configured = true;
         
-        CampaignConfig storage campaign = campaigns[campaignId];
-        campaign.tierCount = tierNames.length;
-        campaign.active = true;
-        
-        for (uint256 i = 0; i < tierNames.length; i++) {
-            require(bytes(tierNames[i]).length > 0, "Tier name cannot be empty");
-            require(bytes(baseURIs[i]).length > 0, "Base URI cannot be empty");
+        for (uint256 i = 0; i < minScores.length; i++) {
+            require(bytes(names[i]).length > 0, "Tier name cannot be empty");
             require(maxSupplies[i] > 0, "Max supply must be positive");
+            require(minScores[i] <= 100, "Score cannot exceed 100");
             
-            campaign.tiers[i] = TierConfig({
-                tierId: i,
-                name: tierNames[i],
-                baseURI: baseURIs[i],
+            if (i > 0) {
+                require(minScores[i] > minScores[i-1], "Scores must be in ascending order");
+            }
+            
+            rewards.tiers.push(RewardTier({
+                minScore: minScores[i],
                 maxSupply: maxSupplies[i],
                 currentSupply: 0,
+                name: names[i],
+                imageURI: imageURIs[i],
                 active: true
-            });
-            campaign.scoreThresholds[i] = scoreThresholds[i];
-            
-            emit TierConfigured(campaignId, i, tierNames[i], maxSupplies[i], scoreThresholds[i]);
+            }));
         }
         
-        emit CampaignConfigured(campaignId, tierNames.length);
+        emit CampaignConfigured(campaignId, minScores.length);
     }
     
-    /**
-     * @dev Update tier configuration
-     */
-    function updateTierConfig(
-        uint256 campaignId,
-        uint256 tierId,
-        string memory baseURI,
-        uint256 maxSupply,
-        bool active
-    ) external onlyOwner {
-        require(campaigns[campaignId].tierCount > 0, "Campaign not configured");
-        require(tierId < campaigns[campaignId].tierCount, "Invalid tier ID");
-        require(maxSupply >= campaigns[campaignId].tiers[tierId].currentSupply, "Max supply cannot be less than current supply");
+    function getQualifiedTier(uint256 campaignId, uint256 score) public view returns (uint256, bool) {
+        CampaignRewards storage rewards = campaignRewards[campaignId];
+        require(rewards.configured, "Campaign not configured");
+        require(score <= 100, "Invalid score");
         
-        TierConfig storage tier = campaigns[campaignId].tiers[tierId];
-        if (bytes(baseURI).length > 0) {
-            tier.baseURI = baseURI;
-        }
-        tier.maxSupply = maxSupply;
-        tier.active = active;
-    }
-    
-    
-    function mint(
-        address to, 
-        uint256 campaignId, 
-        uint256 tierId
-    ) external onlyAuthorizedMinter returns (uint256) {
-        require(to != address(0), "Cannot mint to zero address");
-        require(campaigns[campaignId].active, "Campaign not active");
-        require(campaigns[campaignId].tierCount > 0, "Campaign not configured");
-        require(tierId < campaigns[campaignId].tierCount, "Invalid tier ID");
-        
-        TierConfig storage tier = campaigns[campaignId].tiers[tierId];
-        require(tier.active, "Tier not active");
-        require(tier.currentSupply < tier.maxSupply, "Tier supply exhausted");
-        
-        uint256 tokenId = _nextTokenId++;
-        tier.currentSupply++;
-        tokenCampaign[tokenId] = campaignId;
-        tokenTier[tokenId] = tierId;
-        
-        _safeMint(to, tokenId);
-        _setTokenURI(tokenId, string(abi.encodePacked(tier.baseURI, Strings.toString(tokenId))));
-        
-        emit NFTMinted(to, tokenId, campaignId, tierId, tier.name);
-        return tokenId;
-    }
-    
-    /**
-     * @dev Determine which tier a score qualifies for
-     * For single-tier campaigns, always returns tier 0
-     * For multi-tier campaigns, returns highest qualifying tier
-     */
-    function determineTierForScore(uint256 campaignId, uint256 score) external view returns (uint256) {
-        require(campaigns[campaignId].tierCount > 0, "Campaign not configured");
-        require(score <= 100, "Score cannot exceed 100");
-        
-        CampaignConfig storage campaign = campaigns[campaignId];
-        
-        // For single-tier campaigns, always return tier 0 if score meets minimum
-        if (campaign.tierCount == 1) {
-            require(score >= campaign.scoreThresholds[0], "Score too low");
-            return 0;
-        }
-        
-        // For multi-tier campaigns, find highest qualifying tier
-        for (uint256 i = campaign.tierCount; i > 0; i--) {
+        for (uint256 i = rewards.tiers.length; i > 0; i--) {
             uint256 tierId = i - 1;
-            if (score >= campaign.scoreThresholds[tierId]) {
-                return tierId;
+            RewardTier storage tier = rewards.tiers[tierId];
+            
+            if (score >= tier.minScore && tier.active && tier.currentSupply < tier.maxSupply) {
+                return (tierId, true);
             }
         }
         
-        revert("Score too low for any tier");
+        return (0, false);
     }
     
-    /**
-     * @dev Check if a tier is available for minting
-     */
-    function tierAvailable(uint256 campaignId, uint256 tierId) external view returns (bool) {
-        if (!campaigns[campaignId].active || campaigns[campaignId].tierCount == 0 || tierId >= campaigns[campaignId].tierCount) {
-            return false;
+    function mintReward(
+        address to,
+        uint256 campaignId,
+        uint256 userScore
+    ) external onlyAuthorizedMinter returns (bool) {
+        require(to != address(0), "Cannot mint to zero address");
+        
+        CampaignRewards storage rewards = campaignRewards[campaignId];
+        require(rewards.configured, "Campaign not configured");
+        require(!rewards.hasClaimed[to], "User already claimed reward");
+        
+        (uint256 tierId, bool qualified) = getQualifiedTier(campaignId, userScore);
+        require(qualified, "User not qualified for any tier");
+        
+        RewardTier storage tier = rewards.tiers[tierId];
+        tier.currentSupply++;
+        rewards.hasClaimed[to] = true;
+        rewards.claimedTier[to] = tierId;
+        
+        uint256 tokenId = _tokenIdCounter++;
+        tokenToCampaign[tokenId] = campaignId;
+        tokenToTier[tokenId] = tierId;
+        
+        _safeMint(to, tokenId);
+        
+        string memory fullURI = string(abi.encodePacked(
+            tier.imageURI,
+            "/",
+            tokenId.toString(),
+            ".json"
+        ));
+        _setTokenURI(tokenId, fullURI);
+        
+        emit NFTRewardMinted(to, campaignId, tierId, tokenId, tier.name);
+        return true;
+    }
+    
+    function batchMintRewards(
+        address[] memory users,
+        uint256 campaignId,
+        uint256[] memory scores
+    ) external onlyAuthorizedMinter returns (uint256) {
+        require(users.length == scores.length, "Array length mismatch");
+        require(users.length > 0, "Empty arrays");
+        
+        uint256 successCount = 0;
+        
+        for (uint256 i = 0; i < users.length; i++) {
+            try this.mintReward(users[i], campaignId, scores[i]) returns (bool success) {
+                if (success) successCount++;
+            } catch {
+                continue;
+            }
         }
         
-        TierConfig storage tier = campaigns[campaignId].tiers[tierId];
-        return tier.active && tier.currentSupply < tier.maxSupply;
+        return successCount;
     }
     
-    /**
-     * @dev Check if campaign is single-tier (what used to be "simple")
-     */
-    function isSingleTier(uint256 campaignId) external view returns (bool) {
-        return campaigns[campaignId].tierCount == 1;
+    function hasUserClaimed(uint256 campaignId, address user) external view returns (bool) {
+        return campaignRewards[campaignId].hasClaimed[user];
     }
     
-    /**
-     * @dev Check if campaign is multi-tier (what used to be "tiered")
-     */
-    function isMultiTier(uint256 campaignId) external view returns (bool) {
-        return campaigns[campaignId].tierCount > 1;
+    function getCampaignRewardInfo(uint256 campaignId) external view returns (uint256 tierCount) {
+        return campaignRewards[campaignId].tiers.length;
     }
     
-    /**
-     * @dev Get tier information
-     */
     function getTierInfo(uint256 campaignId, uint256 tierId) external view returns (
-        string memory name,
-        string memory baseURI,
+        uint256 minScore,
         uint256 maxSupply,
         uint256 currentSupply,
-        uint256 scoreThreshold,
+        string memory name,
+        string memory imageURI,
         bool active
     ) {
-        require(tierId < campaigns[campaignId].tierCount, "Invalid tier ID");
+        require(tierId < campaignRewards[campaignId].tiers.length, "Invalid tier ID");
         
-        TierConfig storage tier = campaigns[campaignId].tiers[tierId];
+        RewardTier storage tier = campaignRewards[campaignId].tiers[tierId];
         return (
-            tier.name,
-            tier.baseURI,
+            tier.minScore,
             tier.maxSupply,
             tier.currentSupply,
-            campaigns[campaignId].scoreThresholds[tierId],
+            tier.name,
+            tier.imageURI,
             tier.active
         );
     }
     
-    /**
-     * @dev Get campaign information
-     */
-    function getCampaignInfo(uint256 campaignId) external view returns (
-        uint256 tierCount,
-        bool active,
-        string[] memory tierNames
-    ) {
-        CampaignConfig storage campaign = campaigns[campaignId];
-        string[] memory names = new string[](campaign.tierCount);
-        
-        for (uint256 i = 0; i < campaign.tierCount; i++) {
-            names[i] = campaign.tiers[i].name;
-        }
-        
-        return (campaign.tierCount, campaign.active, names);
-    }
-    
-    /**
-     * @dev Get all tier thresholds for a campaign
-     */
-    function getCampaignThresholds(uint256 campaignId) external view returns (uint256[] memory) {
-        require(campaigns[campaignId].tierCount > 0, "Campaign not configured");
-        
-        uint256 tierCount = campaigns[campaignId].tierCount;
-        uint256[] memory thresholds = new uint256[](tierCount);
-        
-        for (uint256 i = 0; i < tierCount; i++) {
-            thresholds[i] = campaigns[campaignId].scoreThresholds[i];
-        }
-        
-        return thresholds;
-    }
-    
-    /**
-     * @dev Get token's campaign and tier information
-     */
-    function getTokenInfo(uint256 tokenId) external view returns (
-        uint256 campaignId,
-        uint256 tierId,
-        string memory tierName
-    ) {
-        require(_ownerOf(tokenId) != address(0), "Token does not exist");
-        
-        uint256 campId = tokenCampaign[tokenId];
-        uint256 tId = tokenTier[tokenId];
-        string memory tName = campaigns[campId].tiers[tId].name;
-        
-        return (campId, tId, tName);
-    }
-    
-    /**
-     * @dev Set campaign active status
-     */
-    function setCampaignStatus(uint256 campaignId, bool active) external onlyOwner {
-        require(campaigns[campaignId].tierCount > 0, "Campaign not configured");
-        campaigns[campaignId].active = active;
-        emit CampaignStatusChanged(campaignId, active);
-    }
-    
-    /**
-     * @dev Set minter authorization
-     */
     function setMinterAuthorization(address minter, bool authorized) external onlyOwner {
         require(minter != address(0), "Invalid minter address");
         authorizedMinters[minter] = authorized;
-        emit MinterAuthorized(minter, authorized);
     }
     
-    /**
-     * @dev Get total supply for a campaign
-     */
-    function getCampaignTotalSupply(uint256 campaignId) external view returns (uint256 totalSupply, uint256 totalMinted) {
-        require(campaigns[campaignId].tierCount > 0, "Campaign not configured");
-        
-        uint256 supply = 0;
-        uint256 minted = 0;
-        
-        for (uint256 i = 0; i < campaigns[campaignId].tierCount; i++) {
-            supply += campaigns[campaignId].tiers[i].maxSupply;
-            minted += campaigns[campaignId].tiers[i].currentSupply;
-        }
-        
-        return (supply, minted);
-    }
-    
-    /**
-     * @dev Override functions for ERC721URIStorage
-     */
     function tokenURI(uint256 tokenId) public view override(ERC721, ERC721URIStorage) returns (string memory) {
         return super.tokenURI(tokenId);
     }
