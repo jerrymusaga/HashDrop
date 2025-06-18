@@ -3,11 +3,11 @@ pragma solidity ^0.8.13;
 
 import {Test, console} from "forge-std/Test.sol";
 import "../src/Campaign.sol";
-import "../src/Rewards.sol";
+import "../src/RewardsManager.sol";
 
 contract HashDropCampaignTest is Test {
     HashDropCampaign public campaign;
-    HashDropRewards public rewards;
+    HashDropRewardsManager public rewardsManager;
     
     address public owner = address(0x1);
     address public treasury = address(0x2);
@@ -21,7 +21,11 @@ contract HashDropCampaignTest is Test {
         vm.startPrank(owner);
         
         campaign = new HashDropCampaign(treasury);
-        rewards = new HashDropRewards();
+        
+        // Deploy NFT and Token contracts, then RewardsManager
+        HashDropNFT nftContract = new HashDropNFT();
+        HashDropToken tokenContract = new HashDropToken();
+        rewardsManager = new HashDropRewardsManager(address(nftContract), address(tokenContract));
         
         vm.stopPrank();
     }
@@ -44,7 +48,7 @@ contract HashDropCampaignTest is Test {
             "Test campaign description",
             7 days,
             HashDropCampaign.RewardType.NFT,
-            address(rewards),
+            address(rewardsManager),
             1000000,
             chains,
             false
@@ -65,14 +69,14 @@ contract HashDropCampaignTest is Test {
         chains[1] = 43114; // Avalanche
         
         uint256 cost = campaign.calculateCampaignCost(2, true);
-        assertEq(cost, 3.5 ether); // 2 + 0.5 + 1 AVAX
+        assertEq(cost, 1.4 ether); // 0.1 + 0.3 + 1.0 AVAX
         
         uint256 campaignId = campaign.createCampaign{value: cost}(
             "#premiumtest",
             "Premium test campaign",
             30 days,
             HashDropCampaign.RewardType.NFT,
-            address(rewards),
+            address(rewardsManager),
             2000000,
             chains,
             true // premium monitoring
@@ -97,7 +101,7 @@ contract HashDropCampaignTest is Test {
             "Participation test",
             7 days,
             HashDropCampaign.RewardType.NFT,
-            address(rewards),
+            address(rewardsManager),
             1000000,
             chains,
             false
@@ -155,7 +159,7 @@ contract HashDropCampaignTest is Test {
             "First campaign",
             7 days,
             HashDropCampaign.RewardType.NFT,
-            address(rewards),
+            address(rewardsManager),
             1000000,
             chains,
             false
@@ -167,7 +171,7 @@ contract HashDropCampaignTest is Test {
             "Second campaign",
             7 days,
             HashDropCampaign.RewardType.NFT,
-            address(rewards),
+            address(rewardsManager),
             1000000,
             chains,
             false
@@ -188,7 +192,7 @@ contract HashDropCampaignTest is Test {
             "Insufficient fee test",
             7 days,
             HashDropCampaign.RewardType.NFT,
-            address(rewards),
+            address(rewardsManager),
             1000000,
             chains,
             false
@@ -212,7 +216,7 @@ contract HashDropCampaignTest is Test {
             "Fee collection test",
             7 days,
             HashDropCampaign.RewardType.NFT,
-            address(rewards),
+            address(rewardsManager),
             1000000,
             chains,
             false
@@ -227,5 +231,3 @@ contract HashDropCampaignTest is Test {
         assertEq(treasury.balance, initialBalance + cost);
     }
 }
-
-
