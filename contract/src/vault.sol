@@ -132,7 +132,7 @@ contract HashDropVault is Ownable, ReentrancyGuard, AutomationCompatibleInterfac
         
         // Auto-process if threshold met and no VRF needed
         if (users.length >= BATCH_SIZE_THRESHOLD && !vrfNeeded) {
-            _processBatch(batchId);
+            _processBatchInternal(batchId);
         }
         
         return batchId;
@@ -154,13 +154,13 @@ contract HashDropVault is Ownable, ReentrancyGuard, AutomationCompatibleInterfac
         require(sizeReady || timeReady, "Batch not ready for processing");
         require(!batch.vrfSelectionNeeded, "VRF selection pending");
         
-        _processBatch(batchId);
+        _processBatchInternal(batchId);
     }
     
     /**
      * @dev Internal batch processing logic
      */
-    function _processBatch(uint256 batchId) internal nonReentrant {
+    function _processBatchInternal(uint256 batchId) internal nonReentrant {
         BatchRequest storage batch = batchRequests[batchId];
         require(!batch.processed, "Batch already processed");
         
@@ -186,7 +186,7 @@ contract HashDropVault is Ownable, ReentrancyGuard, AutomationCompatibleInterfac
         
         // Mark users as rewarded in campaign contract
         for (uint256 i = 0; i < batch.users.length; i++) {
-            try this._markUserRewarded(batch.campaignId, batch.users[i]) {} catch {
+            try this.markUserRewardedExternal(batch.campaignId, batch.users[i]) {} catch {
                 // Continue if marking fails
             }
         }
@@ -223,7 +223,7 @@ contract HashDropVault is Ownable, ReentrancyGuard, AutomationCompatibleInterfac
         
         if (success) {
             // Mark user as rewarded
-            try this._markUserRewarded(campaignId, user) {} catch {}
+            try this.markUserRewardedExternal(campaignId, user) {} catch {}
             
             vaultStats.totalRewardsDistributed++;
         }
@@ -234,7 +234,7 @@ contract HashDropVault is Ownable, ReentrancyGuard, AutomationCompatibleInterfac
     /**
      * @dev External function to mark user as rewarded (for try-catch)
      */
-    function _markUserRewarded(uint256 campaignId, address user) external {
+    function markUserRewardedExternal(uint256 campaignId, address user) external {
         require(msg.sender == address(this), "Internal function only");
         
         (bool success,) = campaignContract.call(
@@ -313,7 +313,7 @@ contract HashDropVault is Ownable, ReentrancyGuard, AutomationCompatibleInterfac
                     bool timeReady = block.timestamp >= batch.timestamp + BATCH_TIME_THRESHOLD;
                     
                     if (sizeReady || timeReady) {
-                        try this._processBatch(batchId) {} catch {
+                        try this.processBatchExternal(batchId) {} catch {
                             // Continue with next batch if one fails
                         }
                     }
@@ -325,11 +325,11 @@ contract HashDropVault is Ownable, ReentrancyGuard, AutomationCompatibleInterfac
     }
     
     /**
-     * @dev External wrapper for _processBatch (for try-catch in performUpkeep)
+     * @dev External wrapper for batch processing (for try-catch in performUpkeep)
      */
-    function _processBatch(uint256 batchId) external {
+    function processBatchExternal(uint256 batchId) external {
         require(msg.sender == address(this), "Internal function only");
-        _processBatch(batchId);
+        _processBatchInternal(batchId);
     }
     
     /**
@@ -474,7 +474,7 @@ contract HashDropVault is Ownable, ReentrancyGuard, AutomationCompatibleInterfac
         require(batchId > 0 && batchId <= batchCounter, "Invalid batch ID");
         require(!batchRequests[batchId].processed, "Batch already processed");
         
-        _processBatch(batchId);
+        _processBatchInternal(batchId);
     }
     
     /**

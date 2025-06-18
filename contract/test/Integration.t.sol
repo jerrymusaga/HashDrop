@@ -4,11 +4,15 @@ pragma solidity ^0.8.13;
 import {Test, console} from "forge-std/Test.sol";
 import "../src/Campaign.sol";
 import "../src/NFT.sol";
+import "../src/Token.sol";
+import "../src/RewardsManager.sol";
 import "../src/vault.sol";
 
 contract IntegrationTest is Test {
     HashDropCampaign public campaign;
-    HashDropRewards public rewards;
+    HashDropNFT public nftContract;
+    HashDropToken public tokenContract;
+    HashDropRewardsManager public rewardsManager;
     HashDropVault public vault;
     
     address public owner = address(0x1);
@@ -19,10 +23,12 @@ contract IntegrationTest is Test {
         vm.startPrank(owner);
         
         campaign = new HashDropCampaign(treasury);
-        rewards = new HashDropRewards();
-        vault = new HashDropVault(address(campaign), address(rewards));
+        nftContract = new HashDropNFT();
+        tokenContract = new HashDropToken();
+        rewardsManager = new HashDropRewardsManager(address(nftContract), address(tokenContract));
+        vault = new HashDropVault(address(campaign), address(rewardsManager));
         
-        rewards.setMinterAuthorization(address(vault), true);
+        rewardsManager.setMinterAuthorization(address(vault), true);
         
         vm.stopPrank();
     }
@@ -43,7 +49,7 @@ contract IntegrationTest is Test {
             "Complete workflow test",
             30 days,
             HashDropCampaign.RewardType.NFT,
-            address(rewards),
+            address(rewardsManager),
             5000000,
             chains,
             false
@@ -53,14 +59,13 @@ contract IntegrationTest is Test {
         
         vm.stopPrank();
         
-        // 2. Owner configures rewards
+        // 2. Owner configures NFT rewards
         vm.startPrank(owner);
         
         uint256[] memory minScores = new uint256[](3);
         uint256[] memory maxSupplies = new uint256[](3);
         string[] memory names = new string[](3);
         string[] memory imageURIs = new string[](3);
-        uint256[] memory tokenAmounts = new uint256[](3);
         
         minScores[0] = 10;
         minScores[1] = 50;
@@ -78,13 +83,9 @@ contract IntegrationTest is Test {
         imageURIs[1] = "https://api.complete.com/silver";
         imageURIs[2] = "https://api.complete.com/gold";
         
-        for (uint256 i = 0; i < 3; i++) {
-            tokenAmounts[i] = 0;
-        }
+        rewardsManager.configureNFTRewards(campaignId, minScores, maxSupplies, names, imageURIs);
         
-        rewards.configureCampaignRewards(campaignId, true, minScores, maxSupplies, names, imageURIs, tokenAmounts);
-        
-        console.log(" Rewards configured");
+        console.log(" NFT Rewards configured");
         
         // 3. Simulate participants
         address[] memory participants = new address[](5);
@@ -120,8 +121,8 @@ contract IntegrationTest is Test {
         // 6. Verify results
         for (uint256 i = 0; i < participants.length; i++) {
             if (scores[i] >= 10) { // Should qualify for some tier
-                assertGt(rewards.balanceOf(participants[i]), 0);
-                assertTrue(rewards.hasUserClaimed(campaignId, participants[i]));
+                assertGt(nftContract.balanceOf(participants[i]), 0);
+                assertTrue(rewardsManager.hasUserClaimed(campaignId, participants[i]));
                 
                 (uint256 userScore, , bool rewarded) = campaign.getUserParticipation(campaignId, participants[i]);
                 assertEq(userScore, scores[i]);
@@ -143,11 +144,92 @@ contract IntegrationTest is Test {
         assertEq(totalParticipants, participants.length);
         assertGt(totalRewardsDistributed, 0);
         
-        console.log(" Vault stats verified");
+        console.log("Vault stats verified");
         console.log("Total rewards distributed:", totalRewardsDistributed);
         
         vm.stopPrank();
         
         console.log(" Complete workflow test passed!");
+    }
+    
+    function testTokenRewardWorkflow() public {
+        console.log("Testing Token Reward Workflow");
+        
+        // 1. Brand creates token campaign
+        vm.startPrank(brand);
+        vm.deal(brand, 100 ether);
+        
+        uint256[] memory chains = new uint256[](1);
+        chains[0] = 43113;
+        
+        uint256 cost = campaign.calculateCampaignCost(1, false);
+        uint256 campaignId = campaign.createCampaign{value: cost}(
+            "#tokentest",
+            "Token reward test",
+            30 days,
+            HashDropCampaign.RewardType.TOKEN,
+            address(rewardsManager),
+            5000000,
+            chains,
+            false
+        );
+        
+        vm.stopPrank();
+        
+        // 2. Configure token rewards
+        vm.startPrank(owner);
+        
+        uint256[] memory minScores = new uint256[](2);
+        uint256[] memory maxSupplies = new uint256[](2);
+        string[] memory names = new string[](2);
+        uint256[] memory tokenAmounts = new uint256[](2);
+        
+        minScores[0] = 10;
+        minScores[1] = 70;
+        
+        maxSupplies[0] = 1000;
+        maxSupplies[1] = 500;
+        
+        names[0] = "Participation Tokens";
+        names[1] = "Quality Tokens";
+        
+        tokenAmounts[0] = 50 * 10**18; // 50 tokens
+        tokenAmounts[1] = 150 * 10**18; // 150 tokens
+        
+        rewardsManager.configureTokenRewards(campaignId, minScores, maxSupplies, names, tokenAmounts);
+        
+        // 3. Add participants and process
+        address[] memory participants = new address[](3);
+        uint256[] memory scores = new uint256[](3);
+        
+        participants[0] = address(0x1001);
+        participants[1] = address(0x1002);
+        participants[2] = address(0x1003);
+        
+        scores[0] = 25;  // Gets tier 0
+        scores[1] = 85;  // Gets tier 1
+        scores[2] = 5;   // No reward
+        
+        uint256 participantFees = participants.length * campaign.PER_PARTICIPANT_FEE();
+        vm.deal(owner, participantFees);
+        
+        campaign.batchRecordParticipation{value: participantFees}(
+            campaignId,
+            participants,
+            scores
+        );
+        
+        uint256 batchId = vault.createBatchRewardRequest(campaignId, participants, scores);
+        vm.warp(block.timestamp + 2 hours);
+        vault.processBatch(batchId);
+        
+        // 4. Verify token balances
+        assertEq(tokenContract.balanceOf(participants[0]), 50 * 10**18);
+        assertEq(tokenContract.balanceOf(participants[1]), 150 * 10**18);
+        assertEq(tokenContract.balanceOf(participants[2]), 0);
+        
+        console.log(" Token reward workflow completed");
+        
+        vm.stopPrank();
     }
 }

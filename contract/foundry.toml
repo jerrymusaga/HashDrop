@@ -11,8 +11,18 @@ solc_version = "0.8.20"
 rpc_endpoints = { avalanche = "https://api.avax.network/ext/bc/C/rpc", fuji = "https://api.avax-test.network/ext/bc/C/rpc" }
 
 # Gas settings for Avalanche
-gas_limit = 8000000
-gas_price = 25000000000  # 25 gwei
+gas_limit = 30000000        # Increased from 8M to 30M
+gas_price = 25000000000     # 25 gwei
+
+# Test-specific settings
+[profile.default.fuzz]
+runs = 100
+
+[profile.default.invariant]
+runs = 100
+
+# Explicitly set gas limit for tests
+gas_limit = 30000000
 
 remappings = [
   '@chainlink/contracts/=lib/chainlink-brownie-contracts/contracts/',
@@ -22,6 +32,7 @@ remappings = [
 [profile.ci]
 fuzz = { runs = 10000 }
 invariant = { runs = 1000 }
+gas_limit = 30000000
 
 [fmt]
 line_length = 120
@@ -31,5 +42,8 @@ bracket_spacing = true
 [doc]
 out = "docs"
 title = "HashDrop Documentation"
+
+# Increase memory limit for large contracts
+memory_limit = "2147483648"  # 2GB
 
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options

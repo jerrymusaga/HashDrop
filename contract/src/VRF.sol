@@ -6,7 +6,10 @@ import "@chainlink/contracts/src/v0.8/vrf/interfaces/VRFCoordinatorV2Interface.s
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
-
+/**
+ * @title HashDropVRF
+ * @dev Chainlink VRF integration for provably fair reward distribution
+ */
 contract HashDropVRF is VRFConsumerBaseV2, Ownable, ReentrancyGuard {
     VRFCoordinatorV2Interface COORDINATOR;
     
@@ -34,12 +37,12 @@ contract HashDropVRF is VRFConsumerBaseV2, Ownable, ReentrancyGuard {
         address[] winners;
         uint256 timestamp;
         address requester; // Who requested the selection
-        bytes32 vrfRequestId; // VRF request ID
+        uint256 vrfRequestId; // VRF request ID (changed from bytes32 to uint256)
     }
     
     // Storage
     mapping(uint256 => RandomSelection) public selections;
-    mapping(bytes32 => uint256) public requestToSelection;
+    mapping(uint256 => uint256) public requestToSelection; // Changed from bytes32 to uint256
     uint256 public selectionCounter;
     
     // Contract references
@@ -120,7 +123,7 @@ contract HashDropVRF is VRFConsumerBaseV2, Ownable, ReentrancyGuard {
         selection.requester = msg.sender;
         
         // Request randomness from Chainlink VRF
-        bytes32 requestId = COORDINATOR.requestRandomWords(
+        uint256 requestId = COORDINATOR.requestRandomWords(
             keyHash,
             subscriptionId,
             requestConfirmations,
@@ -168,7 +171,7 @@ contract HashDropVRF is VRFConsumerBaseV2, Ownable, ReentrancyGuard {
         selection.timestamp = block.timestamp;
         selection.requester = msg.sender;
         
-        bytes32 requestId = COORDINATOR.requestRandomWords(
+        uint256 requestId = COORDINATOR.requestRandomWords(
             keyHash,
             subscriptionId,
             requestConfirmations,
@@ -191,11 +194,11 @@ contract HashDropVRF is VRFConsumerBaseV2, Ownable, ReentrancyGuard {
     }
     
     /**
-     * @dev Chainlink VRF callback function
-     * @param requestId The VRF request ID
+     * @dev Chainlink VRF callback function - FIXED SIGNATURE
+     * @param requestId The VRF request ID (uint256, not bytes32)
      * @param randomWords Array of random words from VRF
      */
-    function fulfillRandomWords(bytes32 requestId, uint256[] memory randomWords) internal override {
+    function fulfillRandomWords(uint256 requestId, uint256[] memory randomWords) internal override {
         uint256 selectionId = requestToSelection[requestId];
         RandomSelection storage selection = selections[selectionId];
         
@@ -326,11 +329,7 @@ contract HashDropVRF is VRFConsumerBaseV2, Ownable, ReentrancyGuard {
         }
     }
     
-    /**
-     * @dev Get selection results
-     * @param selectionId The selection ID
-     * @return Selection details and results
-     */
+    
     function getSelectionResults(uint256 selectionId) external view returns (
         uint256 campaignId,
         address[] memory candidates,
